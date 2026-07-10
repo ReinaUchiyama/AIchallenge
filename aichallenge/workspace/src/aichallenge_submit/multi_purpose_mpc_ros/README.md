@@ -1,33 +1,34 @@
 # multi_purpose_mpc_ros
 
-このパッケージはリポジトリ内（`aichallenge/workspace/src/aichallenge_submit/multi_purpose_mpc_ros/`）に直接収録されています。別途 `git clone` は不要です。
+## setup
+```
+cd /aichallenge/workspace/src/aichallenge_submit/
+git clone git@github.com:Roborovsky-Racers/multi_purpose_mpc_ros.git
+cd multi_purpose_mpc_ros
+git clone git@github.com:Roborovsky-Racers/Multi-Purpose-MPC.git -b aic-2024
+```
 
 ## build
-
-autoware コンテナ内で実行します（`make autoware-bash` または `make autoware-build`）：
-
-```bash
-cd /aichallenge/workspace
-colcon build --symlink-install --allow-overriding gyro_odometer \
-  --cmake-args -DCMAKE_BUILD_TYPE=Release
+```
+cd /aichallenge/workspace/
+cb
 ```
 
-- ビルド時に仮想環境が `${ROS_WS}/install/multi_purpose_mpc_ros/.venv` に作成されます。
+- virtual env will be created to ${ROS_WS}/install/multi_purpose_mpc_ros/.venv when build time
 
 ## run
-
-### MPC コントローラー
-```bash
-ros2 run multi_purpose_mpc_ros run_mpc_controller.bash
+### sample simple publisher node
+```
+ros2 run multi_purpose_mpc_ros run.bash
 ```
 
-### MPC シミュレーション
-```bash
-ros2 run multi_purpose_mpc_ros run_mpc_simulation.bash
+### Multi-Purpose-MPC simulation
+```
+ros2 run multi_purpose_mpc_ros simulation.bash
 ```
 
-### まとめて起動（コントローラー + シミュレーション）
-```bash
+### both
+```
 ros2 launch multi_purpose_mpc_ros test.launch.xml
 ```
 
@@ -35,7 +36,7 @@ ros2 launch multi_purpose_mpc_ros test.launch.xml
 This repository includes code derived from:
 
 Multi-Purpose-MPC  
-Author: Mats Steinweg  
+Author: Mats Steinweg
 Original repository: https://github.com/matssteinweg/Multi-Purpose-MPC
 
 Used with permission from the author.

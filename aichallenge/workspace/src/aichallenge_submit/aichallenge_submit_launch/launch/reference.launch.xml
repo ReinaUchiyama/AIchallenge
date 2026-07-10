@@ -18,7 +18,7 @@
 
   <!-- Control method -->
   <arg name="control_method" default="mpc"
-      description="Select control: mpc, pure_pursuit, tiny_lidar_net, pilot_net, joycon, rl_train"/>
+       description="Select control: mpc, pure_pursuit, tiny_lidar_net, pilot_net, joycon"/>
 
   <!-- Global parameters -->
   <group scoped="false">
@@ -173,18 +173,12 @@
     <include file="$(find-pkg-share aichallenge_submit_launch)/launch/control/joycon.launch.xml"/>
   </group>
 
-
   <group if="$(var simulation)">
     <node pkg="aichallenge_awsim_adapter" exec="actuation_cmd_converter" name="actuation_cmd_converter" output="screen">
       <param name="steer_delay_sec" value="0.0"/>
       <param name="csv_path_accel_map" value="$(find-pkg-share aichallenge_submit_launch)/data/accel_map.csv"/>
       <param name="csv_path_brake_map" value="$(find-pkg-share aichallenge_submit_launch)/data/brake_map.csv"/>
     </node>
-  </group>
-
-  <group if="$(eval &quot;'$(var control_method)' == 'rl_train'&quot;)">
-    <include file="$(find-pkg-share aichallenge_submit_launch)/launch/control/rl_train.launch.xml"/>
-
   </group>
 
   <!-- Map -->

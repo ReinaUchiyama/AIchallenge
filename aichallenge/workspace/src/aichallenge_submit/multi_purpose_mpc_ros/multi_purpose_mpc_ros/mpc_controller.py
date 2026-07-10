@@ -506,6 +506,13 @@ class MPCController(Node):
         compute_speed_profile(self._carN_center, self._mpc_cfg_center)
         #compute_speed_profile(self._car10_center, self._mpc_cfg_center)
 
+        # Lane lock on curves configuration
+        self._curve_lane_lock_enabled = bool(getattr(cfg_ref_path, "curve_lane_lock_enabled", True))
+        self._curve_lane_lock_kappa_threshold = float(getattr(cfg_ref_path, "curve_lane_lock_kappa_threshold", 0.05))
+        self._curve_lane_lock_lookahead_wps = int(getattr(cfg_ref_path, "curve_lane_lock_lookahead_wps", 15))
+        self._curve_lane_lock_lookbehind_wps = int(getattr(cfg_ref_path, "curve_lane_lock_lookbehind_wps", 5))
+        self._curve_lane_lock_wps = getattr(cfg_ref_path, "curve_lane_lock_wps", [])
+
         # デフォルトは Race セット
         self._reference_pathN = self._reference_pathN_race
         #self._reference_path10 = self._reference_path10_race
@@ -590,6 +597,7 @@ class MPCController(Node):
         self._stuck_speed_threshold = float(get_cfg("speed_threshold", 0.15))
         self._stuck_forward_cmd_threshold = float(get_cfg("forward_cmd_threshold", 0.8))
         self._stuck_time_threshold = float(get_cfg("stuck_time_threshold", 2.0))
+        self._stuck_gnss_distance_threshold = float(get_cfg("gnss_distance_threshold", 0.3))
         self._stuck_reverse_duration = float(get_cfg("reverse_duration", 3.0))
         self._stuck_cooldown = float(get_cfg("cooldown", 2.0))
         self._stuck_forward_reverse_speed = abs(float(get_cfg("reverse_speed", 1.0)))
@@ -612,6 +620,8 @@ class MPCController(Node):
         self._stuck_pre_reverse_duration = float(get_cfg("pre_reverse_duration", 0.0))
         self._stuck_gear_shift_delay = float(get_cfg("gear_shift_delay", 1.0))
         self._stuck_max_shift_wait = float(get_cfg("max_shift_wait", 5.0))
+        self._stuck_collision_window = float(get_cfg("collision_window", 20.0))
+        self._stuck_collision_count_threshold = int(get_cfg("collision_count_threshold", 3))
         self._stuck_use_actuation_cmd = bool(get_cfg("use_actuation_cmd", True))
         self._stuck_actuation_accel_cmd = abs(float(get_cfg("actuation_accel_cmd", 1.0)))
         self._stuck_actuation_brake_cmd = abs(float(get_cfg("actuation_brake_cmd", 0.0)))
@@ -674,6 +684,8 @@ class MPCController(Node):
         self._has_moved_once = False
         self._stuck_pre_drive_until = None
         self._stuck_wait_for_drive = False
+        self._gnss_history = []
+        self._collision_times = []
 
         if self._stuck_recovery_enabled:
             self.get_logger().info(
@@ -1060,6 +1072,7 @@ class MPCController(Node):
             self._stuck_recovery_until = None
             self._stuck_cooldown_until = now_sec + self._stuck_cooldown
             self._stuck_since = None
+            self._gnss_history = []
             self._stuck_control_mode_requested = False
             self._last_stuck_gear_command = None
             self._stuck_reverse_drive_after = None
@@ -1098,7 +1111,32 @@ class MPCController(Node):
             self._stuck_since = None
             return False
 
-        if abs(actual_speed) < self._stuck_speed_threshold and u[0] > self._stuck_forward_cmd_threshold:
+        # GNSSによる位置変化のチェック
+        gnss_is_stuck = False
+        gnss_moved_dist = None
+        if self._gnss_pose is not None:
+            self._gnss_history.append((now_sec, self._gnss_pose.pose.pose.position.x, self._gnss_pose.pose.pose.position.y))
+        
+        # 不要になった古い履歴を削除
+        cutoff = now_sec - (self._stuck_time_threshold + 1.0)
+        self._gnss_history = [item for item in self._gnss_history if item[0] >= cutoff]
+
+        if len(self._gnss_history) > 1:
+            target_t = now_sec - self._stuck_time_threshold
+            ref_item = min(self._gnss_history, key=lambda item: abs(item[0] - target_t))
+            if now_sec - ref_item[0] >= self._stuck_time_threshold * 0.8:
+                curr_item = self._gnss_history[-1]
+                gnss_moved_dist = math.hypot(curr_item[1] - ref_item[1], curr_item[2] - ref_item[2])
+                if gnss_moved_dist < self._stuck_gnss_distance_threshold:
+                    gnss_is_stuck = True
+
+        # スピードが遅い、またはGNSS位置に変化がない場合をスタック状態とする
+        is_stuck_state = (
+            abs(actual_speed) < self._stuck_speed_threshold
+            or gnss_is_stuck
+        )
+
+        if is_stuck_state and u[0] > self._stuck_forward_cmd_threshold:
             if self._stuck_since is None:
                 self._stuck_since = now_sec
             elif now_sec - self._stuck_since >= self._stuck_time_threshold:
@@ -1119,8 +1157,12 @@ class MPCController(Node):
                 u[0] = 0.0
                 u[1] = 0.0
                 self._stuck_reverse_drive_active = False
+                
+                # 詳細な検知理由をログ出力
+                reason_speed = f"speed({actual_speed:.2f}) < threshold({self._stuck_speed_threshold:.2f})"
+                reason_gnss = f"gnss_dist({gnss_moved_dist:.3f}) < threshold({self._stuck_gnss_distance_threshold:.2f})" if gnss_moved_dist is not None else "gnss_dist=None"
                 self.get_logger().warn(
-                    f"[StuckRecovery] vehicle seems stuck; commanding reverse "
+                    f"[StuckRecovery] vehicle seems stuck ({reason_speed} or {reason_gnss}); commanding reverse "
                     f"({self._stuck_reverse_command_mode}, "
                     f"gear={getattr(self._gear_report, 'report', None)}).",
                     throttle_duration_sec=0.5,
@@ -1255,8 +1297,10 @@ class MPCController(Node):
 
         diff_condition = msg.data - self._last_condition
         if diff_condition > 30.0:
-            self._last_colliding_time = self.get_clock().now()
-            self.get_logger().warning(f"Collision detected!")
+            now = self.get_clock().now()
+            self._last_colliding_time = now
+            self._collision_times.append(now.nanoseconds / 1e9)
+            self.get_logger().warning(f"Collision detected! Total recent: {len(self._collision_times)}")
         self._last_condition = msg.data
 
     def _stop_request_callback(self, msg: Empty) -> None:
@@ -1639,6 +1683,42 @@ class MPCController(Node):
         if not self.USE_OBSTACLE_AVOIDANCE:
             opponent_ahead_detected = False
 
+        # Lock trajectory (CSV) switching during curves (when following centerline)
+        if self._curve_lane_lock_enabled:
+            was_following_centerline = getattr(self, '_opponent_ahead_detected', False)
+            if was_following_centerline:
+                is_in_curve = False
+                current_wp = self._car.get_closest_waypoint(pose.x, pose.y)
+                N_wps = self._reference_path.n_waypoints
+                reversed_wp = N_wps - 1 - current_wp
+                for r in self._curve_lane_lock_wps:
+                    if len(r) == 2:
+                        start, end = r[0], r[1]
+                        if start <= end:
+                            if start <= reversed_wp <= end:
+                                is_in_curve = True
+                                break
+                        else:
+                            if reversed_wp >= start or reversed_wp <= end:
+                                is_in_curve = True
+                                break
+                
+                if is_in_curve:
+                    opponent_ahead_detected = True
+
+        # Check if we should force centerline due to multiple recent collisions
+        now_sec = now.nanoseconds / 1e9
+        self._collision_times = [t for t in self._collision_times if now_sec - t < self._stuck_collision_window]
+        force_centerline_by_collision = (len(self._collision_times) >= self._stuck_collision_count_threshold)
+
+        if force_centerline_by_collision:
+            opponent_ahead_detected = True
+            self.get_logger().warn(
+                f"[CollisionSwitch] Multiple recent collisions detected ({len(self._collision_times)} in {self._stuck_collision_window:.1f}s). "
+                "Forcing centerline for safety.",
+                throttle_duration_sec=2.0
+            )
+
         self._opponent_ahead_detected = opponent_ahead_detected
         self._print_obstacle_detected = opponent_ahead_detected
 
@@ -1742,13 +1822,30 @@ class MPCController(Node):
 
         if opponent_ahead is not None:
             if is_overtake_zone:
-                # 3車線用の選択ロジック:
-                if opponent_offset > 0.0:
-                    # 前方車両が左側にいる -> 右車線 (L0) を走行して追い越し
-                    new_target_lane_idx = 0
+                opp_wp = self._reference_path.get_waypoint(opponent_ahead)
+                # 追い越しに必要な最小の横方向スペース [m] (自車幅 + 相手車幅半分 + マージン)
+                MIN_OVERTAKE_SPACE = 2.1  
+                
+                # 相手の位置におけるコース左右境界までの残りスペース
+                space_left = opp_wp.ub - opponent_offset
+                space_right = opponent_offset - opp_wp.lb
+                
+                left_is_free = (space_left >= MIN_OVERTAKE_SPACE)
+                right_is_free = (space_right >= MIN_OVERTAKE_SPACE)
+                
+                if left_is_free and right_is_free:
+                    # 両方空いている場合は、より広いスペースがある方を選択
+                    if space_left > space_right:
+                        new_target_lane_idx = 2  # 左から追い越し (L2)
+                    else:
+                        new_target_lane_idx = 0  # 右から追い越し (L0)
+                elif left_is_free:
+                    new_target_lane_idx = 2      # 左からのみ追い越し可能 (L2)
+                elif right_is_free:
+                    new_target_lane_idx = 0      # 右からのみ追い越し可能 (L0)
                 else:
-                    # 前方車両が右側にいる -> 左車線 (L2) を走行して追い越し
-                    new_target_lane_idx = 2
+                    # どちらもスペースが狭すぎる場合は無理せず中央(L1)で追従
+                    new_target_lane_idx = 1
             else:
                 # 追い越し不可エリア -> 中央車線 (L1) を走行して追従
                 new_target_lane_idx = 1
@@ -1756,9 +1853,35 @@ class MPCController(Node):
             # 追い越しモード自体が終了した場合はターゲット車線をクリア
             new_target_lane_idx = None
 
-        # Apply lane lock timer (2.0 seconds) to avoid chattering
         current_time_sec = float(now.nanoseconds) / 1e9
         prev_lane_idx = self._target_lane_idx
+
+        # Check if vehicle is in or near a curve based on waypoint ranges (when following centerline)
+        is_curve_locked = False
+        if self._curve_lane_lock_enabled:
+            # Check if currently following centerline
+            if getattr(self, '_opponent_ahead_detected', False):
+                is_in_curve = False
+                N_wps = self._reference_path.n_waypoints
+                reversed_wp = N_wps - 1 - wp
+                for r in self._curve_lane_lock_wps:
+                    if len(r) == 2:
+                        start, end = r[0], r[1]
+                        if start <= end:
+                            if start <= reversed_wp <= end:
+                                is_in_curve = True
+                                break
+                        else:
+                            if reversed_wp >= start or reversed_wp <= end:
+                                is_in_curve = True
+                                break
+                
+                if is_in_curve:
+                    is_curve_locked = True
+                    if prev_lane_idx is None:
+                        new_target_lane_idx = 1  # Force center lane (L1) to restrict corridor
+                    else:
+                        new_target_lane_idx = prev_lane_idx  # Stay in the current lane
 
         if new_target_lane_idx != prev_lane_idx:
             can_change_lane = True
@@ -1769,9 +1892,16 @@ class MPCController(Node):
                 if elapsed < 2.5:
                     can_change_lane = False  # Lock lane change
 
+            # Curve lock override: force lane constraint immediately if in curve
+            if is_curve_locked:
+                can_change_lane = True
+
             if can_change_lane:
                 self._target_lane_idx = new_target_lane_idx
-                self._last_lane_change_time = current_time_sec
+                # Only update the lane change timestamp if it was an actual lane change request
+                # and not just forcing center lane from None
+                if not (prev_lane_idx is None and new_target_lane_idx == 1):
+                    self._last_lane_change_time = current_time_sec
                 if new_target_lane_idx is not None:
                     target_str = "right (L0)" if new_target_lane_idx == 0 else "left (L2)" if new_target_lane_idx == 2 else "center (L1)"
                     self.get_logger().info(
