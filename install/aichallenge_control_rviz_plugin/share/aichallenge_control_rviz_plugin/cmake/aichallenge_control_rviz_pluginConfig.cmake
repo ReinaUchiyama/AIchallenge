@@ -1,0 +1,1 @@
+/home/takenoyama/aichallenge-racingkart/build/aichallenge_control_rviz_plugin/ament_cmake_core/aichallenge_control_rviz_pluginConfig.cmake

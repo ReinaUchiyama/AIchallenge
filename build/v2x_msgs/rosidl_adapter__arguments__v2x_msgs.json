@@ -1,0 +1,7 @@
+{
+  "package_name": "v2x_msgs",
+  "non_idl_tuples": [
+    "/home/takenoyama/aichallenge-racingkart/aichallenge/workspace/src/aichallenge_system/v2x_msgs:msg/V2XVehiclePosition.msg",
+    "/home/takenoyama/aichallenge-racingkart/aichallenge/workspace/src/aichallenge_system/v2x_msgs:msg/V2XVehiclePositionArray.msg"
+  ]
+}

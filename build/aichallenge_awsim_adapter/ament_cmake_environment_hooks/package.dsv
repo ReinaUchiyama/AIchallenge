@@ -1,0 +1,4 @@
+source;share/aichallenge_awsim_adapter/local_setup.bash
+source;share/aichallenge_awsim_adapter/local_setup.dsv
+source;share/aichallenge_awsim_adapter/local_setup.sh
+source;share/aichallenge_awsim_adapter/local_setup.zsh

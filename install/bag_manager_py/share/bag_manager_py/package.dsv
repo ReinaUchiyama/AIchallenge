@@ -1,0 +1,5 @@
+source;share/bag_manager_py/local_setup.bash
+source;share/bag_manager_py/local_setup.dsv
+source;share/bag_manager_py/local_setup.ps1
+source;share/bag_manager_py/local_setup.sh
+source;share/bag_manager_py/local_setup.zsh

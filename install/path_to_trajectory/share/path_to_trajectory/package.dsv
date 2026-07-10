@@ -1,0 +1,5 @@
+source;share/path_to_trajectory/local_setup.bash
+source;share/path_to_trajectory/local_setup.dsv
+source;share/path_to_trajectory/local_setup.ps1
+source;share/path_to_trajectory/local_setup.sh
+source;share/path_to_trajectory/local_setup.zsh

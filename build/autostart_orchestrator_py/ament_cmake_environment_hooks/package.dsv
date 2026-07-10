@@ -1,0 +1,4 @@
+source;share/autostart_orchestrator_py/local_setup.bash
+source;share/autostart_orchestrator_py/local_setup.dsv
+source;share/autostart_orchestrator_py/local_setup.sh
+source;share/autostart_orchestrator_py/local_setup.zsh

@@ -1,0 +1,1 @@
+pluginlib;rclcpp;rcpputils;rviz_common;geometry_msgs;rosidl_typesupport_introspection_cpp;std_msgs;std_srvs;qtbase5-dev;qtbase5-dev-tools;ament_lint_auto;ament_lint_common

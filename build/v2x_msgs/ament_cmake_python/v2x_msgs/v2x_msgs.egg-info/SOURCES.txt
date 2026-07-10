@@ -1,0 +1,9 @@
+setup.py
+v2x_msgs/__init__.py
+v2x_msgs.egg-info/PKG-INFO
+v2x_msgs.egg-info/SOURCES.txt
+v2x_msgs.egg-info/dependency_links.txt
+v2x_msgs.egg-info/top_level.txt
+v2x_msgs/msg/__init__.py
+v2x_msgs/msg/_v2_x_vehicle_position.py
+v2x_msgs/msg/_v2_x_vehicle_position_array.py

@@ -36,4 +36,11 @@ export ROS_HOME="${out_dir}/ros"
 export ROS_LOG_DIR="${ROS_HOME}/log"
 mkdir -p "${ROS_LOG_DIR}"
 
+if [ -f /autoware/install/setup.bash ]; then
+    source /autoware/install/setup.bash
+fi
+if [ -f /aichallenge/workspace/install/setup.bash ]; then
+    source /aichallenge/workspace/install/setup.bash
+fi
+
 ros2 launch aichallenge_system_launch aichallenge_system.launch.xml "${opts[@]}" "domain_id:=$id"

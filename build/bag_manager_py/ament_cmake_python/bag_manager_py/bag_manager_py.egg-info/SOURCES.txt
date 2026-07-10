@@ -1,0 +1,8 @@
+setup.py
+bag_manager_py/__init__.py
+bag_manager_py/bag_manager_core.py
+bag_manager_py/bag_manager_node.py
+bag_manager_py.egg-info/PKG-INFO
+bag_manager_py.egg-info/SOURCES.txt
+bag_manager_py.egg-info/dependency_links.txt
+bag_manager_py.egg-info/top_level.txt

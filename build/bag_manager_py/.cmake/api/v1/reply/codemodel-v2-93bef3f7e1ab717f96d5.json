@@ -1,0 +1,88 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"hasInstallRule" : true,
+					"jsonFile" : "directory-.-13038fae6366472a9967.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.12"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3
+					]
+				}
+			],
+			"name" : "",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "bag_manager_py",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "ament_cmake_python_build_bag_manager_py_egg::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-ament_cmake_python_build_bag_manager_py_egg-00d0d0ed6783f5ed1f26.json",
+					"name" : "ament_cmake_python_build_bag_manager_py_egg",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "ament_cmake_python_symlink_bag_manager_py::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-ament_cmake_python_symlink_bag_manager_py-4719cafb2927865f31db.json",
+					"name" : "ament_cmake_python_symlink_bag_manager_py",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "bag_manager_py_uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-bag_manager_py_uninstall-5c3afe5a181b44a845ef.json",
+					"name" : "bag_manager_py_uninstall",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-uninstall-15a493f4a3b2e5dcacce.json",
+					"name" : "uninstall",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "/home/takenoyama/aichallenge-racingkart/build/bag_manager_py",
+		"source" : "/home/takenoyama/aichallenge-racingkart/aichallenge/workspace/src/aichallenge_tools/bag_manager_py"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 3
+	}
+}

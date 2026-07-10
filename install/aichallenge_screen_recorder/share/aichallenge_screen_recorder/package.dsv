@@ -1,0 +1,5 @@
+source;share/aichallenge_screen_recorder/local_setup.bash
+source;share/aichallenge_screen_recorder/local_setup.dsv
+source;share/aichallenge_screen_recorder/local_setup.ps1
+source;share/aichallenge_screen_recorder/local_setup.sh
+source;share/aichallenge_screen_recorder/local_setup.zsh

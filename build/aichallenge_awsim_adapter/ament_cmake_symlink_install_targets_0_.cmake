@@ -1,0 +1,1 @@
+ament_cmake_symlink_install_targets("TARGET_FILES" "/home/takenoyama/aichallenge-racingkart/build/aichallenge_awsim_adapter/actuation_cmd_converter" "TARGETS" "actuation_cmd_converter" "DESTINATION" "lib/aichallenge_awsim_adapter")

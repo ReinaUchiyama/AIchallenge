@@ -1,0 +1,88 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"hasInstallRule" : true,
+					"jsonFile" : "directory-.-b3bb5c33e4bea3214add.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.12"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3
+					]
+				}
+			],
+			"name" : "",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "aichallenge_awsim_adapter",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "actuation_cmd_converter::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-actuation_cmd_converter-62b4160024b163549c06.json",
+					"name" : "actuation_cmd_converter",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "aichallenge_awsim_adapter::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-aichallenge_awsim_adapter-3e92d15ccc2e86811b23.json",
+					"name" : "aichallenge_awsim_adapter",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "aichallenge_awsim_adapter_uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-aichallenge_awsim_adapter_uninstall-f3fd53165c4b94f0ce43.json",
+					"name" : "aichallenge_awsim_adapter_uninstall",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-uninstall-2d9d26dc54db28c30643.json",
+					"name" : "uninstall",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "/home/takenoyama/aichallenge-racingkart/build/aichallenge_awsim_adapter",
+		"source" : "/home/takenoyama/aichallenge-racingkart/aichallenge/workspace/src/aichallenge_system/aichallenge_awsim_adapter"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 3
+	}
+}

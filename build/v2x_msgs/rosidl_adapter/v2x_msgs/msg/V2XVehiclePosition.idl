@@ -1,0 +1,30 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from v2x_msgs/msg/V2XVehiclePosition.msg
+// generated code does not contain a copyright notice
+
+#include "geometry_msgs/msg/Point.idl"
+#include "geometry_msgs/msg/Vector3.idl"
+#include "std_msgs/msg/Header.idl"
+
+module v2x_msgs {
+  module msg {
+    struct V2XVehiclePosition {
+      @verbatim (language="comment", text=
+        "観測時刻 (stamp) と座標フレーム (frame_id, e.g. \"map\")")
+      std_msgs::msg::Header header;
+
+      @verbatim (language="comment", text=
+        "車両を識別する ID (e.g. \"d1\"..\"d4\")")
+      string vehicle_id;
+
+      @verbatim (language="comment", text=
+        "各車両の位置 (header の frame_id 系)")
+      geometry_msgs::msg::Point position;
+
+      @verbatim (language="comment", text=
+        "位置不確実性 (x/y/z 軸の標準偏差)")
+      @unit (value="m")
+      geometry_msgs::msg::Vector3 covariance;
+    };
+  };
+};

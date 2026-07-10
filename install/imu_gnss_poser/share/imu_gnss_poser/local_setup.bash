@@ -1,0 +1,1 @@
+/home/takenoyama/aichallenge-racingkart/build/imu_gnss_poser/ament_cmake_environment_hooks/local_setup.bash

@@ -1,0 +1,1 @@
+ament_cmake_symlink_install_targets("TARGET_FILES" "/home/takenoyama/aichallenge-racingkart/build/aichallenge_awsim_adapter/libaichallenge_awsim_adapter.so" "TARGETS" "aichallenge_awsim_adapter" "ARCHIVE_DESTINATION" "lib" "LIBRARY_DESTINATION" "lib" "RUNTIME_DESTINATION" "bin")

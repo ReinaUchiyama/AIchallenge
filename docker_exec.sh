@@ -51,3 +51,5 @@ echo "Connecting to container: $CONTAINER_NAME (ID: $SELECTED_CONTAINER)"
 
 # Execute bash in the selected container
 docker exec -it "$SELECTED_CONTAINER" bash
+
+

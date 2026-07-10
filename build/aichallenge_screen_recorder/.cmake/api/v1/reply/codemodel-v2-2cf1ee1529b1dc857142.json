@@ -1,0 +1,175 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"childIndexes" : 
+					[
+						1
+					],
+					"hasInstallRule" : true,
+					"jsonFile" : "directory-.-cb07c3497a0234a87dce.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.12"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						5,
+						6,
+						7,
+						8,
+						9
+					]
+				},
+				{
+					"build" : "gtest",
+					"jsonFile" : "directory-gtest-a2408fe1a73b92c5e636.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.8"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 1,
+					"source" : "/opt/ros/humble/src/gtest_vendor",
+					"targetIndexes" : 
+					[
+						1,
+						2,
+						3,
+						4
+					]
+				}
+			],
+			"name" : "",
+			"projects" : 
+			[
+				{
+					"childIndexes" : 
+					[
+						1
+					],
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "aichallenge_screen_recorder",
+					"targetIndexes" : 
+					[
+						0,
+						5,
+						6,
+						7,
+						8,
+						9
+					]
+				},
+				{
+					"directoryIndexes" : 
+					[
+						1
+					],
+					"name" : "gtest",
+					"parentIndex" : 0,
+					"targetIndexes" : 
+					[
+						1,
+						2,
+						3,
+						4
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "aichallenge_screen_recorder_uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-aichallenge_screen_recorder_uninstall-b7ad5627d88c4afbf173.json",
+					"name" : "aichallenge_screen_recorder_uninstall",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "gtest::@0af4add9fe94340e763e",
+					"jsonFile" : "target-gtest-446e69f1bf7567583749.json",
+					"name" : "gtest",
+					"projectIndex" : 1
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "gtest_autogen::@0af4add9fe94340e763e",
+					"jsonFile" : "target-gtest_autogen-c63ffd7bc4be628ee1d5.json",
+					"name" : "gtest_autogen",
+					"projectIndex" : 1
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "gtest_main::@0af4add9fe94340e763e",
+					"jsonFile" : "target-gtest_main-6608745178312a528918.json",
+					"name" : "gtest_main",
+					"projectIndex" : 1
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "gtest_main_autogen::@0af4add9fe94340e763e",
+					"jsonFile" : "target-gtest_main_autogen-538ee8964b60e6564fca.json",
+					"name" : "gtest_main_autogen",
+					"projectIndex" : 1
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "screen_recorder_node::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-screen_recorder_node-527567b9d08fb317e5bb.json",
+					"name" : "screen_recorder_node",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "screen_recorder_node_autogen::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-screen_recorder_node_autogen-8156f36f1980655eedc5.json",
+					"name" : "screen_recorder_node_autogen",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "test_encoder_worker::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-test_encoder_worker-91f12625484659d72b60.json",
+					"name" : "test_encoder_worker",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "test_encoder_worker_autogen::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-test_encoder_worker_autogen-946c8ff3f3944f7fe138.json",
+					"name" : "test_encoder_worker_autogen",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-uninstall-0c31b53da2f6233035c2.json",
+					"name" : "uninstall",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "/home/takenoyama/aichallenge-racingkart/build/aichallenge_screen_recorder",
+		"source" : "/home/takenoyama/aichallenge-racingkart/aichallenge/workspace/src/aichallenge_system/aichallenge_screen_recorder"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 3
+	}
+}

@@ -1,0 +1,1 @@
+/home/takenoyama/aichallenge-racingkart/aichallenge/workspace/src/aichallenge_system/autostart_orchestrator_py/autostart_orchestrator_py/autostart_orchestrator_node.py

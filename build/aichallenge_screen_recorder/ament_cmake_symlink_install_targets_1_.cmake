@@ -1,0 +1,1 @@
+ament_cmake_symlink_install_targets("TARGET_FILES" "/home/takenoyama/aichallenge-racingkart/build/aichallenge_screen_recorder/screen_recorder_node" "TARGETS" "screen_recorder_node" "DESTINATION" "lib/aichallenge_screen_recorder")

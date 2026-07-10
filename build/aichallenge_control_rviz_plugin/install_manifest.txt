@@ -1,0 +1,3 @@
+/home/takenoyama/aichallenge-racingkart/install/aichallenge_control_rviz_plugin/lib/libaichallenge_control_rviz_plugin.so
+/home/takenoyama/aichallenge-racingkart/install/aichallenge_control_rviz_plugin/share/aichallenge_control_rviz_plugin/cmake/aichallenge_control_rviz_pluginExport.cmake
+/home/takenoyama/aichallenge-racingkart/install/aichallenge_control_rviz_plugin/share/aichallenge_control_rviz_plugin/cmake/aichallenge_control_rviz_pluginExport-noconfig.cmake
