@@ -1,8 +1,8 @@
 # make file inspired by https://roborovsky-racers.github.io/RoborovskyNote/
 SHELL := /bin/bash
 
-.PHONY: autoware-build autoware-vehicle autoware-simulator autoware-request-initialpose autoware-request-control  awsim-request-start awsim-request-reset autoware-driver-zenoh \
-	simulator dev dev2 dev3 dev4 driver zenoh download rviz2 down down2 down3 down4 ps autoware-bash
+.PHONY: autoware-build autoware-vehicle autoware-simulator autoware-request-initialpose autoware-request-control  awsim-request-start awsim-request-reset autoware-driver-zenoh autoware-driver-zenoh-rosbag \
+	simulator dev dev2 dev3 dev4 driver zenoh download rviz2 down down_all ps autoware-attach autoware-bash eval
 
 # Used by docker-compose.yml for build/eval artifact ownership.
 HOST_UID ?= $(shell id -u)
@@ -88,15 +88,12 @@ gate1 gate2 gate3: simulator autoware-simulator
 	@echo "Start safety gate simulation (AWSIM + Autoware)"
 	@echo "To stop: make down  (docker compose down --remove-orphans)"
 
-# Kept for backward compatibility; `make down` already cleans all projects.
-down2 down3 down4: down
-
-eval:
 eval:
 	@echo "Start evaluation simulation (AWSIM + Autoware)"
 	docker compose up -d autoware-simulator-evaluation
 	$(MAKE) awsim-request-start
 	@echo "To stop: make down  (docker compose down --remove-orphans)"
+
 # remote operation (docker compose up -d rviz2)
 rviz2:
 	docker compose stop rviz2
@@ -104,9 +101,15 @@ rviz2:
 
 # driver + autoware + zenoh
 autoware-driver-zenoh:
-	RUN_MODE=vehicle docker compose up -d driver autoware
+	LOG_DIR=$(LOG_DIR) RUN_MODE=vehicle docker compose up -d driver autoware
 	sleep 15
-	docker compose up -d zenoh
+	LOG_DIR=$(LOG_DIR) docker compose up -d zenoh
+
+# driver + autoware + all-topic rosbag + zenoh
+autoware-driver-zenoh-rosbag:
+	LOG_DIR=$(LOG_DIR) RUN_MODE=vehicle docker compose up -d driver autoware rosbag
+	sleep 15
+	LOG_DIR=$(LOG_DIR) docker compose up -d zenoh
 
 down:
 	@for p in 1 2 3 4; do docker compose -p $$p down --remove-orphans; done
@@ -125,12 +128,11 @@ ps:
 		fi; \
 	done
 
+autoware-attach:
+	@./docker_exec.sh
+
 autoware-bash:
-	@if [ -z "$(VEHICLE_NUM)" ]; then \
-		docker compose exec autoware bash; \
-	else \
-		docker compose -p $(VEHICLE_NUM) exec autoware bash; \
-	fi
+	CMD="bash --rcfile /etc/skel/.bashrc -i" docker compose run --rm --no-deps autoware-command
 
 # Download submission data by asking for credentials interactively
 # Usage:

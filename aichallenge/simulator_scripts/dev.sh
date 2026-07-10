@@ -6,14 +6,14 @@ export ROS_DOMAIN_ID=0
 # 車両数: 第1引数（既定 1）
 vehicles="${1:-1}"
 
-$AWSIM_DIRECTORY/AWSIM.x86_64 \
+exec $AWSIM_DIRECTORY/AWSIM.x86_64 \
     --start-mode count \
     --start-count-seconds 5 \
     --vehicles "${vehicles}" \
     --npcs 0 \
     --boosts 2 \
     --laps unlimited \
-    --timeout unlimited \
+    --timeout 10000000.0 \
     --steer-source ackermann \
     --sound off \
     --collisions on \
