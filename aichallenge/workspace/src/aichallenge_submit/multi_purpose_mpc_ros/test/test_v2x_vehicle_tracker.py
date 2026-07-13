@@ -73,6 +73,7 @@ def test_single_sample_yields_zero_velocity():
     tracker.update(_msg(0.0, [("d2", 1.0, 2.0)]))
 
     assert tracker.velocity("d2") == (0.0, 0.0)
+    assert tracker.has_velocity_estimate("d2") is False
 
 
 def test_unknown_vehicle_velocity_is_zero():
@@ -120,6 +121,8 @@ def test_two_vehicles_tracked_independently():
 
     assert tracker.velocity("d2") == pytest.approx((10.0, 0.0))
     assert tracker.velocity("d3") == pytest.approx((0.0, 5.0))
+    assert tracker.has_velocity_estimate("d2") is True
+    assert tracker.has_velocity_estimate("d3") is True
 
 
 def test_active_ids_reflect_latest_message_only():

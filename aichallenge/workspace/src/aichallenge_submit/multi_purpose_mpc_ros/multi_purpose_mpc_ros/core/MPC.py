@@ -6,12 +6,104 @@ from typing import Tuple
 import numpy as np
 import osqp
 from scipy import sparse
-import matplotlib.pyplot as plt
 import time
 from datetime import datetime
 
+from multi_purpose_mpc_ros.core.spatial_bicycle_models import (
+    understeer_curvature_gain,
+)
+
 # Colors
 PREDICTION = '#BA4A00'
+
+OSQP_SOLVED_STATUSES = {
+    osqp.constant('OSQP_SOLVED'),
+    osqp.constant('OSQP_SOLVED_INACCURATE'),
+}
+OSQP_PRIMAL_INFEASIBLE_STATUSES = {
+    osqp.constant('OSQP_PRIMAL_INFEASIBLE'),
+    osqp.constant('OSQP_PRIMAL_INFEASIBLE_INACCURATE'),
+}
+
+
+def is_valid_osqp_solution(result) -> bool:
+    """Return whether OSQP produced a usable optimal solution."""
+    return (
+        result is not None
+        and result.x is not None
+        and result.info.status_val in OSQP_SOLVED_STATUSES
+        and np.all(np.isfinite(result.x))
+    )
+
+
+def is_primal_infeasible(result) -> bool:
+    """Return whether relaxing path constraints could make the QP feasible."""
+    return (
+        result is not None
+        and result.info.status_val in OSQP_PRIMAL_INFEASIBLE_STATUSES
+    )
+
+
+def is_plausible_mpc_prediction(
+    spatial_states,
+    world_prediction,
+    current_position,
+    lower_bounds,
+    upper_bounds,
+    lateral_tolerance=0.5,
+    max_start_distance=8.0,
+    max_step_distance=5.0,
+) -> bool:
+    """Reject finite but physically implausible solver predictions."""
+    states = np.asarray(spatial_states)
+    if states.ndim != 2 or states.shape[0] < 3 or states.shape[1] < 2:
+        return False
+    if not np.all(np.isfinite(states)):
+        return False
+
+    lower = np.asarray(lower_bounds).reshape(-1)
+    upper = np.asarray(upper_bounds).reshape(-1)
+    n_bounds = min(states.shape[0] - 1, lower.size, upper.size)
+    if n_bounds == 0:
+        return False
+    lateral = states[1:n_bounds + 1, 0]
+    if np.any(lateral < lower[:n_bounds] - lateral_tolerance):
+        return False
+    if np.any(lateral > upper[:n_bounds] + lateral_tolerance):
+        return False
+
+    return is_plausible_world_prediction(
+        world_prediction,
+        current_position,
+        max_start_distance=max_start_distance,
+        max_step_distance=max_step_distance,
+    )
+
+
+def is_plausible_world_prediction(
+    world_prediction,
+    current_position,
+    max_start_distance=8.0,
+    max_step_distance=5.0,
+) -> bool:
+    """Validate a world-frame prediction, including a stored fallback."""
+    x_pred, y_pred = world_prediction
+    points = np.column_stack((x_pred, y_pred))
+    if points.shape[0] == 0 or not np.all(np.isfinite(points)):
+        return False
+
+    current_xy = np.asarray(current_position, dtype=float)
+    if current_xy.shape != (2,) or not np.all(np.isfinite(current_xy)):
+        return False
+    if np.linalg.norm(points[0] - current_xy) > max_start_distance:
+        return False
+    if (
+        len(points) > 1
+        and np.any(np.linalg.norm(np.diff(points, axis=0), axis=1)
+                   > max_step_distance)
+    ):
+        return False
+    return True
 
 ##################
 # MPC Controller #
@@ -19,7 +111,9 @@ PREDICTION = '#BA4A00'
 
 class MPC:
     def __init__(self, model, N, Q, R, QN, StateConstraints, InputConstraints,
-                 ay_max, max_steering_rate, wp_id_offset, use_obstacle_avoidance, use_path_constraints_topic, use_max_kappa_pred=True):
+                 ay_max, max_steering_rate, wp_id_offset, use_obstacle_avoidance,
+                 use_path_constraints_topic, use_max_kappa_pred=True,
+                 understeer_coeff=0.0):
         """
         Constructor for the Model Predictive Controller.
         :param model: bicycle model object to be controlled
@@ -34,6 +128,8 @@ class MPC:
         :param use_obstacle_avoidance: flag to enable obstacle avoidance
         :param use_path_constraints_topic: flag to use path constraints from topic
         :param max_steering_rate: maximum allowed steering rate in rad/s
+        :param understeer_coeff: coefficient K in
+            kappa_actual = kappa_cmd / (1 + K * v^2), in s^2/m^2
         """
         # MPCの設定値と内部変数を初期化する
         # 既存の初期化パラメータ
@@ -108,6 +204,7 @@ class MPC:
         self.state_constraints = StateConstraints
         self.input_constraints = InputConstraints
         self.ay_max = ay_max
+        self.understeer_coeff = max(float(understeer_coeff), 0.0)
 
         # 追加: ステアリングレート制限関連のパラメータ
         self.max_steering_rate = max_steering_rate
@@ -143,6 +240,9 @@ class MPC:
 
     def update_ay_max(self, ay_max: float):
         self.ay_max = ay_max
+
+    def update_understeer_coeff(self, understeer_coeff: float):
+        self.understeer_coeff = max(float(understeer_coeff), 0.0)
 
     def update_wp_id_offset(self, wp_id_offset: int):
         self.wp_id_offset = wp_id_offset
@@ -221,7 +321,8 @@ class MPC:
             #v_ref = 12.5 
 
             # Compute LTV matrices
-            f, A_lin, B_lin = self.model.linearize(v_ref, kappa_ref, delta_s)
+            f, A_lin, B_lin = self.model.linearize(
+                v_ref, kappa_ref, delta_s, self.understeer_coeff)
             eps = 1e-9
             A_lin[np.abs(A_lin) < eps] = eps
             B_lin[np.abs(B_lin) < eps] = eps
@@ -231,8 +332,14 @@ class MPC:
             B_data[n*self.nx*self.nu : (n+1)*self.nx*self.nu] = B_lin.flatten()
 
             # Set reference
-            ur[n*self.nu:(n+1)*self.nu] = [v_ref, kappa_ref]
-            uq[n * self.nx:(n+1)*self.nx] = B_lin.dot([v_ref, kappa_ref]) - f
+            curvature_gain = understeer_curvature_gain(
+                v_ref, self.understeer_coeff)
+            # Request enough commanded curvature for the speed-dependent
+            # model to achieve the reference-path curvature.
+            kappa_cmd_ref = kappa_ref / max(curvature_gain, 1e-3)
+            ur[n*self.nu:(n+1)*self.nu] = [v_ref, kappa_cmd_ref]
+            uq[n * self.nx:(n+1)*self.nx] = B_lin.dot(
+                [v_ref, kappa_cmd_ref]) - f
 
             # Set spatial reference e_y to target lane center with vehicle safety offset
             target_lane = getattr(self.model.reference_path, 'target_lane_idx', None)
@@ -298,6 +405,8 @@ class MPC:
         xmin_dyn[self.nx::self.nx] = lb
         xmax_dyn[self.nx::self.nx] = ub
         xr[self.nx::self.nx] = (lb + ub) / 2
+        self._prediction_lower_bounds = np.array(lb, copy=True)
+        self._prediction_upper_bounds = np.array(ub, copy=True)
 
         # If a target lane is active, preserve lane-center targets for the e_y references.
         target_lane = getattr(self.model.reference_path, 'target_lane_idx', None)
@@ -431,6 +540,7 @@ class MPC:
 
         t0 = time.perf_counter()
 
+        base_wp_id = self.model.wp_id
         self._init_problem(N, self.model.safety_margin)
 
         t1 = time.perf_counter()
@@ -445,27 +555,43 @@ class MPC:
             if self.debug_counter % 20 == 0:
                 print(dec.info.status,flush=True)
             t2 = time.perf_counter()
-            
 
-            control_signals = np.array(dec.x[-N*nu:])
-            use_control_signals = control_signals[1::2]
-
-            if not np.all(use_control_signals):
+            if is_primal_infeasible(dec):
                 for i in range(1, 6):
                     relaxed_safety_margin = self.model.safety_margin * ((5-i) / 5.0)
+                    # _init_problem applies wp_id_offset, so restore the
+                    # unshifted waypoint before every retry.
+                    self.model.wp_id = base_wp_id
                     self._init_problem(N, relaxed_safety_margin)
                     dec = self.optimizer.solve()
                     t2 = time.perf_counter()
-                    control_signals = np.array(dec.x[-N*nu:])
-                    use_control_signals = control_signals[1::2]
 
-                    if self.infeasibility_counter == 0 and np.all(use_control_signals):
+                    if is_valid_osqp_solution(dec):
                         if self.last_solved_wp_id != self.model.wp_id:
                             print(f"Relaxed safety margin by {relaxed_safety_margin} ({5-i}/5) to solve the problem")
                         break
+                    if not is_primal_infeasible(dec):
+                        break
+
+            if not is_valid_osqp_solution(dec):
+                raise ValueError(
+                    f"OSQP failed with status '{dec.info.status}'")
+
+            control_signals = np.array(dec.x[-N*nu:])
 
             # ステア角の計算と保存
             control_signals[1::2] = np.arctan(control_signals[1::2] * self.model.length)
+            x = np.reshape(dec.x[:(N+1)*nx], (N+1, nx))
+            candidate_prediction = self.update_prediction(x, N)
+            if not is_plausible_mpc_prediction(
+                x,
+                candidate_prediction,
+                (self.model.temporal_state.x, self.model.temporal_state.y),
+                self._prediction_lower_bounds,
+                self._prediction_upper_bounds,
+            ):
+                raise ValueError("OSQP returned an implausible prediction")
+
             v = control_signals[0]
             delta = control_signals[1]
 
@@ -479,10 +605,9 @@ class MPC:
 
             self.previous_steering = delta
 
-            # 予測の更新
+            # Commit the candidate only after solver and geometry validation.
             self.current_control = control_signals
-            x = np.reshape(dec.x[:(N+1)*nx], (N+1, nx))
-            self.current_prediction = self.update_prediction(x, N)
+            self.current_prediction = candidate_prediction
 
             u = np.array([v, delta])
             max_delta = np.max(np.abs(control_signals[1:len(control_signals)//3*2:2]))
@@ -492,7 +617,9 @@ class MPC:
             self.infeasibility_counter = 0
             self.last_solved_wp_id = self.model.wp_id
 
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as error:
+            if self.debug_counter % 20 == 0:
+                print(f"[MPCFallback] {error}", flush=True)
             id = nu * (self.infeasibility_counter + 1)
             if id + 2 < len(self.current_control) and not np.all(self.current_control[id:id+2] == 0.0):
                 u = np.array(self.current_control[id:id+2])
@@ -503,8 +630,16 @@ class MPC:
                 max_delta = np.abs(self.previous_steering)
 
             # Keep the last valid prediction when solver fails
-            if prediction_backup is not None:
+            if (
+                prediction_backup is not None
+                and is_plausible_world_prediction(
+                    prediction_backup,
+                    (self.model.temporal_state.x, self.model.temporal_state.y),
+                )
+            ):
                 self.current_prediction = prediction_backup
+            else:
+                self.current_prediction = None
 
             self.infeasibility_counter += 1
 

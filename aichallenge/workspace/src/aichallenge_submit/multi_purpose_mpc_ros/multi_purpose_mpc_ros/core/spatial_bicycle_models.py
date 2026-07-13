@@ -19,6 +19,12 @@ CAR_COLLIDING = '#FF0000'
 CAR_OUTLINE = '#B7950B'
 
 
+def understeer_curvature_gain(speed, understeer_coeff):
+    """Return the achieved/commanded curvature ratio of the simple model."""
+    coeff = max(float(understeer_coeff), 0.0)
+    return 1.0 / (1.0 + coeff * float(speed) ** 2)
+
+
 #########################
 # Temporal State Vector #
 #########################
@@ -358,7 +364,7 @@ class SpatialBicycleModel(ABC):
         pass
 
     @abstractmethod
-    def linearize(self, v_ref, kappa_ref, delta_s):
+    def linearize(self, v_ref, kappa_ref, delta_s, understeer_coeff=0.0):
         pass
 
 
@@ -462,12 +468,15 @@ class BicycleModel(SpatialBicycleModel):
 
         return np.array([d_e_y_d_s, d_e_psi_d_s, d_t_d_s])
 
-    def linearize(self, v_ref, kappa_ref, delta_s):
+    def linearize(self, v_ref, kappa_ref, delta_s, understeer_coeff=0.0):
         """
         Linearize the system equations around provided reference values.
         :param v_ref: velocity reference around which to linearize
         :param kappa_ref: kappa of waypoint around which to linearize
         :param delta_s: distance between current waypoint and next waypoint
+        :param understeer_coeff: speed-dependent curvature loss coefficient
+            in s^2/m^2. The achieved curvature is approximated as
+            kappa_actual = kappa_cmd / (1 + understeer_coeff * v_ref^2).
          """
 
         ###################
@@ -479,7 +488,11 @@ class BicycleModel(SpatialBicycleModel):
         a_2 = np.array([-kappa_ref ** 2 * delta_s, 1, 0])
 
         b_1 = np.array([0, 0])
-        b_2 = np.array([0, delta_s])
+        # At higher speed the vehicle achieves less curvature than the
+        # kinematic model predicts.  Keeping the MPC input as commanded
+        # curvature makes this a simple input-gain correction.
+        curvature_gain = understeer_curvature_gain(v_ref, understeer_coeff)
+        b_2 = np.array([0, curvature_gain * delta_s])
 
         # Handle v_ref == 0 case
         if v_ref == 0:

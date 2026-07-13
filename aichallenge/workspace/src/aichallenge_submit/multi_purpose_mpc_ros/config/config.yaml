@@ -48,6 +48,13 @@ reference_path:
   # use_path_constraints_topic: true
   # use_border_cells_topic: true
 
+trajectory_switch:
+  enter_center_wps: 25   # 前方車がこのWaypoint差未満ならCenterへ切り替え
+  exit_center_wps: 35    # Center中はこのWaypoint差を超えるまで維持
+  behind_release_wps: 12 # 追い越した車が後方へこの差以上離れるまで維持
+  min_hold_sec: 1.0      # 切り替え直後の再切り替え禁止時間
+  exit_confirm_sec: 0.5  # Race復帰条件の継続確認時間
+
 bicycle_model:
   length: 1.087
   width: 1.6   # +safety margin
@@ -57,7 +64,7 @@ mpc:
   # Q: [e_y(横ずれ), e_psi(ヨー角ずれ), t]
   # R: [v, delta]
   # QN: [e_y, e_psi, t]
-  R: [100000.0, 500.0]
+  R: [100000.0, 1000.0]
   R10: [100000.0,100.0]
   a_min: -0.50 # m/s^2
   a_max: 2.5 # m/s^2
@@ -65,12 +72,18 @@ mpc:
   steer_rate_max: 3.00 # rad/s max_steering_rate
   control_rate: 60.0 # Hz Ts=1/control_rate
   #steering_tire_angle_gain_var: 1.639
-  steering_tire_angle_gain_var: 1.50
+  steering_tire_angle_gain_var: 1.68
   # accel_low_pass_gain: 0.1
   # steer_low_pass_gain: 0.3
   accel_low_pass_gain: 0.2
-  steer_low_pass_gain: 1.0
-  wp_id_offset: 3
+  steer_low_pass_gain: 0.5
+  # 遅延後の姿勢を予測するため、固定Waypoint先読みは重ねない。
+  wp_id_offset: 0
+  # 送信済み操舵指令がアクチュエータへ到達するまでの姿勢を予測する。
+  delay_prediction_enabled: true
+  steering_command_delay: 0.15 # [s]
+  delay_prediction_steer_gain: 1.0004
+  delay_prediction_steps: 9
   use_max_kappa_pred: false
   osqp_initialized: false #setup済みならtrueに
 
@@ -80,7 +93,10 @@ mpc:
 
   v_max: 35.0   # km/h
   ay_max: 15.0  # m/s^2, maximum lateral acceleration in curves
-  Q: [3000000.0, 40000000.0, 2000000.0]
+  # kappa_actual = kappa_cmd / (1 + understeer_coeff * v^2)
+  # 0.002 gives about 16% curvature loss at 35 km/h.
+  understeer_coeff: 0.005  # [s^2/m^2]
+  Q: [3000000.0, 55000000.0, 2000000.0]
   QN: [1000000.0, 1000000.0, 10000.0]
 
   ## --- 高速 (gnss delay 0.3) --- ##mak
@@ -127,6 +143,12 @@ v2x_obstacle_avoidance:
   v_max_safety: 35.0           # [m/s]
   position_jump_threshold: 5.0 # [m]
 
+stopped_vehicle_overtake:
+  speed_threshold: 0.3     # [m/s] 前走車を停止とみなす速度
+  max_speed: 10.0          # [m/s] 強制追い越し中の上限速度
+  reverse_distance: 3.0    # [m] 安全な追い越しが解けない場合に後退を待つ車間
+  infeasible_cycles: 4     # 後退待機へ入るMPC infeasible連続回数
+
 stuck_recovery:
   enabled: true
   speed_threshold: 0.15
@@ -142,12 +164,12 @@ stuck_recovery:
   control_mode_request_value: true
   send_gear_command: true
   wait_for_reverse_gear: true
-  pre_reverse_gear_command: 2
+  pre_reverse_gear_command: 22
   pre_reverse_duration: 1.2
   reverse_gear_command: 20
   drive_gear_command: 2
   reverse_gear_reports: "20,21"
-  request_control_mode: false
+  request_control_mode: true
   shift_control_mode_request_value: true
   drive_control_mode_request_value: true
   gear_shift_delay: 1.0

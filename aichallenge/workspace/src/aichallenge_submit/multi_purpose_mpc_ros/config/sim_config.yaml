@@ -68,12 +68,12 @@ stuck_recovery:
   control_mode_request_value: true
   send_gear_command: true
   wait_for_reverse_gear: true
-  pre_reverse_gear_command: 2
+  pre_reverse_gear_command: 22
   pre_reverse_duration: 1.2
   reverse_gear_command: 20
   drive_gear_command: 2
   reverse_gear_reports: "20,21"
-  request_control_mode: false
+  request_control_mode: true
   shift_control_mode_request_value: true
   drive_control_mode_request_value: true
   gear_shift_delay: 1.0

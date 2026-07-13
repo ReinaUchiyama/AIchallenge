@@ -11,6 +11,7 @@ import numpy as np
 import copy
 import os
 import shutil
+from collections import deque
 from datetime import datetime
 
 # ROS 2
@@ -50,6 +51,7 @@ except ModuleNotFoundError:
 from v2x_msgs.msg import V2XVehiclePositionArray
 from multi_purpose_mpc_ros.v2x_vehicle_tracker import (
     V2XVehicleTracker,
+    evaluate_stopped_lead_overtake,
     predictions_to_obstacles,
 )
 
@@ -120,6 +122,7 @@ class MPCConfig:
     a_min: float
     a_max: float
     ay_max: float
+    understeer_coeff: float
     delta_max: float
     steer_rate_max: float
     control_rate: float
@@ -259,6 +262,7 @@ class MPCController(Node):
 
             mpc_cfg = self._mpc_cfg
             self.declare_parameter("ay_max", mpc_cfg.ay_max)
+            self.declare_parameter("understeer_coeff", mpc_cfg.understeer_coeff)
             self.declare_parameter("accel_low_pass_gain", mpc_cfg.accel_low_pass_gain)
             self.declare_parameter("steer_low_pass_gain", mpc_cfg.steer_low_pass_gain)
             self.declare_parameter("wp_id_offset", mpc_cfg.wp_id_offset)
@@ -322,6 +326,12 @@ class MPCController(Node):
                     mpc_cfg.ay_max = param.value
                     self._mpc.update_ay_max(param.value)
                     self.get_logger().warn(f"ay_max was updated to '{param.value}'")
+
+                elif param.name == "understeer_coeff" and param.type_ == Parameter.Type.DOUBLE:
+                    mpc_cfg.understeer_coeff = max(param.value, 0.0)
+                    self._mpc.update_understeer_coeff(param.value)
+                    self.get_logger().warn(
+                        f"understeer_coeff was updated to '{mpc_cfg.understeer_coeff}'")
 
                 elif param.name == "accel_low_pass_gain" and param.type_ == Parameter.Type.DOUBLE:
                     mpc_cfg.accel_low_pass_gain = param.value
@@ -417,6 +427,7 @@ class MPCController(Node):
                 cfg_mpc.a_min,
                 cfg_mpc.a_max,
                 cfg_mpc.ay_max,
+                getattr(cfg_mpc, "understeer_coeff", 0.0),
                 np.deg2rad(cfg_mpc.delta_max_deg),
                 cfg_mpc.steer_rate_max,
                 cfg_mpc.control_rate,
@@ -450,7 +461,8 @@ class MPCController(Node):
                 mpc_cfg.wp_id_offset,
                 self.USE_OBSTACLE_AVOIDANCE,
                 self._cfg.reference_path.use_path_constraints_topic,
-                mpc_cfg.use_max_kappa_pred)
+                mpc_cfg.use_max_kappa_pred,
+                mpc_cfg.understeer_coeff)
 
 
             return mpc_cfg, mpc
@@ -526,12 +538,57 @@ class MPCController(Node):
         self._reference_path = self._reference_pathN
         self._mpc = self._mpcN
 
+        cfg_mpc = self._cfg.mpc  # type: ignore
+        self._delay_prediction_enabled = bool(
+            getattr(cfg_mpc, "delay_prediction_enabled", True))
+        self._steering_command_delay = max(
+            float(getattr(cfg_mpc, "steering_command_delay", 0.15)), 0.0)
+        self._delay_prediction_steer_gain = max(
+            float(getattr(cfg_mpc, "delay_prediction_steer_gain", 1.0)), 0.0)
+        self._delay_prediction_steps = max(
+            int(getattr(cfg_mpc, "delay_prediction_steps", 9)), 1)
+        history_length = max(
+            int(self._mpc_cfg.control_rate *
+                (self._steering_command_delay + 1.0)),
+            self._delay_prediction_steps + 2,
+        )
+        self._steering_command_history = deque(maxlen=history_length)
+
         self._ref_vel_configulator: Optional[ReferenceVelocityConfigulator] = create_ref_vel_configulator()
 
         self._trajectory: Optional[Trajectory] = None
         self._path_constraints = None
         self._last_lane_change_time = None
         self._target_lane_idx = None
+
+        switch_cfg = getattr(self._cfg, "trajectory_switch", None)
+        self._trajectory_enter_center_wps = int(
+            getattr(switch_cfg, "enter_center_wps", 25))
+        self._trajectory_exit_center_wps = int(
+            getattr(switch_cfg, "exit_center_wps", 35))
+        self._trajectory_behind_release_wps = int(
+            getattr(switch_cfg, "behind_release_wps", 12))
+        self._trajectory_switch_min_hold = float(
+            getattr(switch_cfg, "min_hold_sec", 1.0))
+        self._trajectory_exit_confirm = float(
+            getattr(switch_cfg, "exit_confirm_sec", 0.5))
+        self._trajectory_last_switch_time = None
+        self._trajectory_clear_since = None
+        self._trajectory_switch_reason = "initial"
+        self._trajectory_vehicle_id = None
+        self._prev_opponent_ahead_detected = False
+
+        overtake_cfg = getattr(self._cfg, "stopped_vehicle_overtake", None)
+        self._stopped_lead_speed_threshold = float(
+            getattr(overtake_cfg, "speed_threshold", 0.3))
+        self._forced_overtake_speed = float(
+            getattr(overtake_cfg, "max_speed", 10.0))
+        self._close_obstacle_reverse_distance = float(
+            getattr(overtake_cfg, "reverse_distance", 3.0))
+        self._close_obstacle_infeasible_cycles = int(
+            getattr(overtake_cfg, "infeasible_cycles", 5))
+        self._forced_overtake_vehicle_id = None
+        self._close_obstacle_reverse_requested = False
 
         # Obstacles
         if self.USE_OBSTACLE_AVOIDANCE:
@@ -853,11 +910,57 @@ class MPCController(Node):
         # publish raw control command
         self._command_raw_pub.publish(cmd)
 
-        # compensate steering angle for the real vehicle
-        # AWSIMにおいても後段のactuation_cmd_converter でgainを考慮した指令を生成するため、実機/sim問わず
-        # gain を掛ける
-        cmd.lateral.steering_tire_angle *= self._mpc_cfg.steering_tire_angle_gain_var
+        # Store the measured-response-equivalent angle for delay prediction.
+        prediction_steer = float(u[1]) * self._delay_prediction_steer_gain
+        self._steering_command_history.append((
+            float(stamp.nanoseconds) / 1e9,
+            prediction_steer,
+        ))
+
+        # Apply the actuator command gain only to the published command.
+        cmd.lateral.steering_tire_angle *= (
+            self._mpc_cfg.steering_tire_angle_gain_var)
         self._command_pub.publish(cmd)
+
+    def _predict_pose_after_steering_delay(
+        self, pose: Pose2D, speed: float, now_sec: float,
+    ) -> Pose2D:
+        """Predict the state when the newly calculated command reaches the actuator."""
+        predicted = Pose2D()
+        predicted.x = pose.x
+        predicted.y = pose.y
+        predicted.theta = pose.theta
+
+        if (
+            not self._delay_prediction_enabled
+            or self._steering_command_delay <= 0.0
+            or abs(speed) < 1e-3
+        ):
+            return predicted
+
+        step_dt = self._steering_command_delay / self._delay_prediction_steps
+        history = list(self._steering_command_history)
+        fallback_steer = (
+            float(self._last_u[1]) * self._delay_prediction_steer_gain)
+
+        for step in range(self._delay_prediction_steps):
+            source_time = (
+                now_sec + step * step_dt - self._steering_command_delay)
+            steering = fallback_steer
+            for command_time, command_steer in reversed(history):
+                if command_time <= source_time:
+                    steering = command_steer
+                    break
+
+            yaw_rate = speed / self._car.length * math.tan(steering)
+            mid_yaw = predicted.theta + 0.5 * yaw_rate * step_dt
+            predicted.x += speed * math.cos(mid_yaw) * step_dt
+            predicted.y += speed * math.sin(mid_yaw) * step_dt
+            predicted.theta += yaw_rate * step_dt
+
+        predicted.theta = math.atan2(
+            math.sin(predicted.theta), math.cos(predicted.theta))
+        return predicted
 
     def _apply_stuck_reverse_command(self, u) -> None:
         if self._stuck_reverse_command_mode in ("teleop", "awsim_reverse_button"):
@@ -1049,19 +1152,22 @@ class MPCController(Node):
                         )
                     )
                     if waiting_for_reverse:
-                        u[0] = 0.0
+                        if pre_shifting:
+                            u[0] = 0.0
+                        else:
+                            u[0] = abs(self._stuck_forward_reverse_speed)
                         u[1] = 0.0
                         self._stuck_reverse_drive_active = False
-                        if gear_status_known:
-                            self.get_logger().warn(
-                                "[StuckRecovery] pre-shift before reverse "
-                                f"(command={self._gear_pre_reverse_command}, "
-                                f"current={getattr(self._gear_report, 'report', None)})."
-                                if pre_shifting
-                                else "[StuckRecovery] waiting for AWSIM gear to become REVERSE "
-                                f"(current={getattr(self._gear_report, 'report', None)}).",
-                                throttle_duration_sec=1.0,
-                             )
+                        #if gear_status_known:
+                            #self.get_logger().warn(
+                            #    "[StuckRecovery] pre-shift before reverse "
+                            #    f"(command={self._gear_pre_reverse_command}, "
+                            #    f"current={getattr(self._gear_report, 'report', None)})."
+                            #    if pre_shifting
+                            #    else "[StuckRecovery] waiting for AWSIM gear to become REVERSE "
+                            #    f"(current={getattr(self._gear_report, 'report', None)}).",
+                            #    throttle_duration_sec=1.0,
+                            # )
                     else:
                         self._apply_stuck_reverse_command(u)
                         self._publish_stuck_actuation_command(now, self._stuck_actuation_accel_cmd, 0.0, u[1])
@@ -1087,10 +1193,10 @@ class MPCController(Node):
                 msg = Bool()
                 msg.data = True
                 self._awsim_control_mode_request_pub.publish(msg)
-            self.get_logger().info(
-                "[StuckRecovery] reverse finished; returning to MPC control "
-                f"(gear={getattr(self._gear_report, 'report', None)})."
-            )
+            #self.get_logger().info(
+            #    "[StuckRecovery] reverse finished; returning to MPC control "
+            #    f"(gear={getattr(self._gear_report, 'report', None)})."
+            #)
             return False
 
         # 4. 通常時の判定（誤爆防止マスク＆スタック検知）
@@ -1136,7 +1242,13 @@ class MPCController(Node):
             or gnss_is_stuck
         )
 
-        if is_stuck_state and u[0] > self._stuck_forward_cmd_threshold:
+        should_recover_from_close_obstacle = (
+            self._close_obstacle_reverse_requested and is_stuck_state
+        )
+        if is_stuck_state and (
+            u[0] > self._stuck_forward_cmd_threshold
+            or should_recover_from_close_obstacle
+        ):
             if self._stuck_since is None:
                 self._stuck_since = now_sec
             elif now_sec - self._stuck_since >= self._stuck_time_threshold:
@@ -1157,16 +1269,17 @@ class MPCController(Node):
                 u[0] = 0.0
                 u[1] = 0.0
                 self._stuck_reverse_drive_active = False
+                self._close_obstacle_reverse_requested = False
                 
                 # 詳細な検知理由をログ出力
                 reason_speed = f"speed({actual_speed:.2f}) < threshold({self._stuck_speed_threshold:.2f})"
                 reason_gnss = f"gnss_dist({gnss_moved_dist:.3f}) < threshold({self._stuck_gnss_distance_threshold:.2f})" if gnss_moved_dist is not None else "gnss_dist=None"
-                self.get_logger().warn(
-                    f"[StuckRecovery] vehicle seems stuck ({reason_speed} or {reason_gnss}); commanding reverse "
-                    f"({self._stuck_reverse_command_mode}, "
-                    f"gear={getattr(self._gear_report, 'report', None)}).",
-                    throttle_duration_sec=0.5,
-                )
+                #self.get_logger().warn(
+                #    f"[StuckRecovery] vehicle seems stuck ({reason_speed} or {reason_gnss}); commanding reverse "
+                #    f"({self._stuck_reverse_command_mode}, "
+                #    f"gear={getattr(self._gear_report, 'report', None)}).",
+                #    throttle_duration_sec=0.5,
+                #)
                 return True
         else:
             self._stuck_since = None
@@ -1354,6 +1467,11 @@ class MPCController(Node):
 
     def _publish_mpc_pred_marker(self, x_pred, y_pred):
         pred_marker_array = MarkerArray()
+        clear_marker = Marker()
+        clear_marker.header.frame_id = "map"
+        clear_marker.ns = "mpc_pred"
+        clear_marker.action = Marker.DELETEALL
+        pred_marker_array.markers.append(clear_marker)
         m_base = Marker()
         m_base.header.frame_id = "map"
         m_base.ns = "mpc_pred"
@@ -1370,6 +1488,16 @@ class MPCController(Node):
             pred_marker_array.markers.append(m) # type: ignore
         self._mpc_pred_pub.publish(pred_marker_array)
         self._mpc_pred_pub_dummy.publish(pred_marker_array)
+
+    def _clear_mpc_pred_markers(self):
+        marker_array = MarkerArray()
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.ns = "mpc_pred"
+        marker.action = Marker.DELETEALL
+        marker_array.markers.append(marker)
+        self._mpc_pred_pub.publish(marker_array)
+        self._mpc_pred_pub_dummy.publish(marker_array)
 
     def _publish_lane_markers(self, ref_path: ReferencePath, n_lanes: int = 3) -> None:
         """
@@ -1650,6 +1778,8 @@ class MPCController(Node):
 
         closest_opp_ahead = 99999
         closest_opp_behind = 99999
+        closest_opp_ahead_id = None
+        closest_opp_behind_id = None
         if self.USE_OBSTACLE_AVOIDANCE and hasattr(self, '_v2x_tracker'):
             for vid in self._v2x_tracker.active_vehicle_ids():
                 buf = self._v2x_tracker._samples.get(vid)
@@ -1665,19 +1795,52 @@ class MPCController(Node):
                     if wp_diff >= 0:
                         if wp_diff < closest_opp_ahead:
                             closest_opp_ahead = wp_diff
+                            closest_opp_ahead_id = vid
                     else:
                         if abs(wp_diff) < closest_opp_behind:
                             closest_opp_behind = abs(wp_diff)
+                            closest_opp_behind_id = vid
 
-        # Apply hysteresis using both ahead and behind distances
-        if opponent_ahead_detected:
-            # 他車が前方35ステップより先、かつ後方20ステップより後ろに完全に離れるまでCenter軌道を維持
-            if closest_opp_ahead > 25 and closest_opp_behind > 12:
-                opponent_ahead_detected = False
+        # Enter Center at the near threshold and return to Race only after the
+        # farther threshold remains clear. This prevents 26--34 waypoint
+        # opponents from flipping the selected trajectory every cycle.
+        now_sec = float(now.nanoseconds) / 1e9
+        hold_elapsed = (
+            self._trajectory_last_switch_time is None
+            or now_sec - self._trajectory_last_switch_time
+                >= self._trajectory_switch_min_hold
+        )
+        recovery_active = self._stuck_recovery_until is not None
+        forced_overtake_pending = self._forced_overtake_vehicle_id is not None
+
+        if recovery_active:
+            self._trajectory_clear_since = None
+            self._trajectory_switch_reason = "stuck_recovery_hold"
+        elif opponent_ahead_detected:
+            opponent_is_clear = (
+                closest_opp_ahead > self._trajectory_exit_center_wps
+                and closest_opp_behind > self._trajectory_behind_release_wps
+            )
+            if opponent_is_clear and not forced_overtake_pending:
+                if self._trajectory_clear_since is None:
+                    self._trajectory_clear_since = now_sec
+                clear_confirmed = (
+                    now_sec - self._trajectory_clear_since
+                    >= self._trajectory_exit_confirm
+                )
+                if clear_confirmed and hold_elapsed:
+                    opponent_ahead_detected = False
+                    self._trajectory_switch_reason = "opponent_clear"
+            else:
+                self._trajectory_clear_since = None
         else:
-            # 他車が前方35ステップ以内に接近したらCenter軌道に切り替え
-            if closest_opp_ahead < 35:
+            self._trajectory_clear_since = None
+            if (
+                closest_opp_ahead < self._trajectory_enter_center_wps
+                and hold_elapsed
+            ):
                 opponent_ahead_detected = True
+                self._trajectory_switch_reason = "opponent_ahead"
 
         # Enforce racing-line-only behavior when obstacle avoidance is disabled
         if not self.USE_OBSTACLE_AVOIDANCE:
@@ -1705,19 +1868,20 @@ class MPCController(Node):
                 
                 if is_in_curve:
                     opponent_ahead_detected = True
+                    self._trajectory_switch_reason = "curve_hold"
 
         # Check if we should force centerline due to multiple recent collisions
-        now_sec = now.nanoseconds / 1e9
         self._collision_times = [t for t in self._collision_times if now_sec - t < self._stuck_collision_window]
         force_centerline_by_collision = (len(self._collision_times) >= self._stuck_collision_count_threshold)
 
-        if force_centerline_by_collision:
+        if force_centerline_by_collision and not recovery_active:
             opponent_ahead_detected = True
-            self.get_logger().warn(
-                f"[CollisionSwitch] Multiple recent collisions detected ({len(self._collision_times)} in {self._stuck_collision_window:.1f}s). "
-                "Forcing centerline for safety.",
-                throttle_duration_sec=2.0
-            )
+            self._trajectory_switch_reason = "collision_hold"
+            #self.get_logger().warn(
+            #    f"[CollisionSwitch] Multiple recent collisions detected ({len(self._collision_times)} in {self._stuck_collision_window:.1f}s). "
+            #    "Forcing centerline for safety.",
+            #    throttle_duration_sec=2.0
+            #)
 
         self._opponent_ahead_detected = opponent_ahead_detected
         self._print_obstacle_detected = opponent_ahead_detected
@@ -1725,9 +1889,6 @@ class MPCController(Node):
         # 追い越し・追従フラグが立っている場合: Center軌道 (traj_center313.csv)
         # 通常走行時: Race軌道 (traj_race_cl_mpc.csv)
         # --- 切り替え検出: 実際に軌道が変わったときだけ OSQP を再初期化 ---
-        if not hasattr(self, '_prev_opponent_ahead_detected'):
-            self._prev_opponent_ahead_detected = opponent_ahead_detected
-
         trajectory_switched = (opponent_ahead_detected != self._prev_opponent_ahead_detected)
         self._prev_opponent_ahead_detected = opponent_ahead_detected
 
@@ -1753,10 +1914,36 @@ class MPCController(Node):
         # これにより、旧軌道向けに warm-start された状態が新軌道の制約と食い違って
         # infeasible になるリスクを防ぐ。
         if trajectory_switched:
+            self._trajectory_last_switch_time = now_sec
             label = "Race→Center" if opponent_ahead_detected else "Center→Race"
-            self.get_logger().info(f"[TrajectorySwitch] {label}: resetting OSQP solver state.")
-            self._mpcN_race.osqp_initialized = False
-            self._mpcN_center.osqp_initialized = False
+            center_wp_at_switch = self._carN_center.get_closest_waypoint(
+                pose.x, pose.y)
+            if opponent_ahead_detected and closest_opp_ahead_id is not None:
+                self._trajectory_vehicle_id = closest_opp_ahead_id
+            switch_vehicle_id = (
+                closest_opp_ahead_id or self._trajectory_vehicle_id
+                if opponent_ahead_detected
+                else closest_opp_behind_id or self._trajectory_vehicle_id
+            )
+            self.get_logger().info(
+                f"[TrajectorySwitch] {label}: "
+                f"race_wp={wp_temp}, center_wp={center_wp_at_switch}, "
+                f"reason={self._trajectory_switch_reason}, "
+                f"vehicle_id={switch_vehicle_id}, "
+                f"ahead_wps={closest_opp_ahead}, "
+                f"behind_wps={closest_opp_behind}, "
+                f"pose=({pose.x:.2f}, {pose.y:.2f}); "
+                "resetting OSQP solver state."
+            )
+            for switched_mpc in (self._mpcN_race, self._mpcN_center):
+                switched_mpc.osqp_initialized = False
+                switched_mpc.current_prediction = None
+                switched_mpc.current_control = np.zeros_like(
+                    switched_mpc.current_control)
+                switched_mpc.infeasibility_counter = 0
+            self._clear_mpc_pred_markers()
+            if not opponent_ahead_detected:
+                self._trajectory_vehicle_id = None
 
         # --- 重要: self._car / self._mpc / self._reference_path を _carN / _mpcN / _reference_pathN に同期 ---
         # self._carN / _mpcN / _reference_pathN は切り替えブロックで更新されているが、
@@ -1765,8 +1952,11 @@ class MPCController(Node):
         self._mpc = self._mpcN
         self._reference_path = self._reference_pathN
 
-        # 車両モデル更新（1回だけ実行）
-        self._car.update_states(pose.x, pose.y, pose.theta)
+        # Solve from the state at which this cycle's command reaches the actuator.
+        predicted_pose = self._predict_pose_after_steering_delay(
+            pose, v, float(now.nanoseconds) / 1e9)
+        self._car.update_states(
+            predicted_pose.x, predicted_pose.y, predicted_pose.theta)
         wp = self._car.wp_id  # update_states 内で get_closest_waypoint が実行済み
 
 
@@ -1780,6 +1970,8 @@ class MPCController(Node):
         opponent_center = 0.0
         opponent_distance = 99999.0 #前方車両との距離
         opponent_v_lead = 0.0 #前方車両の速度
+        opponent_vehicle_id = None
+        opponent_velocity_valid = False
         min_wp_diff = 99999
 
         # --- Parallel Running Detection (並走検出) ---
@@ -1796,10 +1988,16 @@ class MPCController(Node):
                     opp_wp_id = self._car.get_closest_waypoint(opp_x, opp_y)
                     
                     wp_diff = (opp_wp_id - wp) % N_total
-                    if 0 < wp_diff < 40:  # within ~34 meters (30km/h ≈ 8.3m/s, need ~4s reaction window)
+                    rel_forward = (
+                        (opp_x - pose.x) * math.cos(pose.theta)
+                        + (opp_y - pose.y) * math.sin(pose.theta)
+                    )
+                    same_wp_ahead = (wp_diff == 0 and rel_forward > 0.0)
+                    if same_wp_ahead or 0 < wp_diff < 40:
                         if wp_diff < min_wp_diff:
                             min_wp_diff = wp_diff
                             opponent_ahead = opp_wp_id
+                            opponent_vehicle_id = vid
                             
                             # 前方車両の横オフセットを算出
                             opp_wp = self._reference_path.get_waypoint(opp_wp_id)
@@ -1813,12 +2011,16 @@ class MPCController(Node):
                             opponent_distance = math.hypot(opp_x - pose.x, opp_y - pose.y)
                             opp_vx, opp_vy = self._v2x_tracker.velocity(vid)
                             opponent_v_lead = math.hypot(opp_vx, opp_vy)
+                            opponent_velocity_valid = (
+                                self._v2x_tracker.has_velocity_estimate(vid))
 
         # 常に追い越しを許可する
         is_overtake_zone = True
 
         # Calculate candidate target lane based on opponent position
         new_target_lane_idx = self._target_lane_idx  # Keep current active lane by default
+        left_is_free = False
+        right_is_free = False
 
         if opponent_ahead is not None:
             if is_overtake_zone:
@@ -1854,6 +2056,49 @@ class MPCController(Node):
             new_target_lane_idx = None
 
         current_time_sec = float(now.nanoseconds) / 1e9
+
+        lead_is_stationary = (
+            opponent_vehicle_id is not None
+            and opponent_velocity_valid
+            and opponent_v_lead < self._stopped_lead_speed_threshold
+        )
+        if lead_is_stationary:
+            if self._forced_overtake_vehicle_id != opponent_vehicle_id:
+                action = (
+                    "forcing immediate low-speed overtake"
+                    if left_is_free or right_is_free
+                    else "no safe passing side; keeping stop/reverse fallback armed"
+                )
+                self.get_logger().warn(
+                    "[StoppedVehicle] "
+                    f"vehicle_id={opponent_vehicle_id} "
+                    f"speed={opponent_v_lead:.2f}m/s; {action}.",
+                    throttle_duration_sec=1.0,
+                )
+            self._forced_overtake_vehicle_id = opponent_vehicle_id
+
+        if (
+            self._forced_overtake_vehicle_id is not None
+            and opponent_vehicle_id != self._forced_overtake_vehicle_id
+        ):
+            forced_id = self._forced_overtake_vehicle_id
+            active_ids = self._v2x_tracker.active_vehicle_ids()
+            forced_buf = self._v2x_tracker._samples.get(forced_id)
+            forced_vehicle_passed = forced_id not in active_ids
+            if forced_buf:
+                _, forced_x, forced_y = forced_buf[-1]
+                forced_lon = (
+                    (forced_x - pose.x) * math.cos(pose.theta)
+                    + (forced_y - pose.y) * math.sin(pose.theta)
+                )
+                forced_vehicle_passed = forced_lon < -1.0
+            if forced_vehicle_passed:
+                self.get_logger().info(
+                    f"[StoppedVehicle] vehicle_id={forced_id} "
+                    "forced overtake completed."
+                )
+                self._forced_overtake_vehicle_id = None
+
         prev_lane_idx = self._target_lane_idx
 
         # Check if vehicle is in or near a curve based on waypoint ranges (when following centerline)
@@ -1895,6 +2140,10 @@ class MPCController(Node):
             # Curve lock override: force lane constraint immediately if in curve
             if is_curve_locked:
                 can_change_lane = True
+            # A stationary lead must not remain trapped behind the normal
+            # lane-change cooldown when a passing side is available.
+            if lead_is_stationary and new_target_lane_idx in (0, 2):
+                can_change_lane = True
 
             if can_change_lane:
                 self._target_lane_idx = new_target_lane_idx
@@ -1919,6 +2168,25 @@ class MPCController(Node):
         else:
             # No lane change request, keep active candidate
             self._target_lane_idx = new_target_lane_idx
+
+        tracked_stopped_lead = (
+            lead_is_stationary
+            and opponent_vehicle_id is not None
+            and opponent_vehicle_id == self._forced_overtake_vehicle_id
+        )
+        forced_overtake_active, close_overtake_blocked = (
+            evaluate_stopped_lead_overtake(
+                tracked_stopped_lead=tracked_stopped_lead,
+                distance=opponent_distance,
+                left_is_free=left_is_free,
+                right_is_free=right_is_free,
+                target_lane_idx=self._target_lane_idx,
+                infeasibility_counter=self._mpc.infeasibility_counter,
+                reverse_distance=self._close_obstacle_reverse_distance,
+                infeasible_cycles=self._close_obstacle_infeasible_cycles,
+            )
+        )
+        self._close_obstacle_reverse_requested = close_overtake_blocked
 
         # Apply target lane
         # --- 制約切り替え安定化ウィンドウ ---
@@ -1956,7 +2224,7 @@ class MPCController(Node):
 
         # 追従・追い越し、または対象のWaypoint区間（カーブなど慎重さが求められる箇所）はwp_id_offsetを1にする
         is_in_cautious_zone = (210 <= wp <= 243) or (261 <= wp <= 286)
-        active_offset = 1 if (is_overtaking or is_in_cautious_zone) else self._default_wp_id_offset
+        active_offset = 0 if (is_overtaking or is_in_cautious_zone) else self._default_wp_id_offset
         self._mpc.update_wp_id_offset(active_offset)
         
         # MPCの実行
@@ -1972,6 +2240,7 @@ class MPCController(Node):
         else:
             ref_vel_kmph = self._mpc_cfg.v_max
 
+        emergency_brake_active = False
         if self.USE_OBSTACLE_AVOIDANCE:
             # --- ACC spacing control (車間距離維持制御) ---
             # 前方車両がいて、かつ自車の走行ライン上（横方向の差が 1.2m 未満）に他車が位置する場合に
@@ -1981,7 +2250,11 @@ class MPCController(Node):
             lat_dist = abs(opponent_offset - e_y)
 
             # --- Standard Follow (Same Lane) ---
-            if opponent_ahead is not None and lat_dist < 1.2:
+            if (
+                opponent_ahead is not None
+                and lat_dist < 1.2
+                and not forced_overtake_active
+            ):
                 if opponent_distance < 15.0:
                     d_target = 8.0 # 目標車間距離 (5m 〜 10m の中央値 7.5m)
                     K_p = 1.2       # 比例ゲイン
@@ -1990,12 +2263,12 @@ class MPCController(Node):
 
                     ref_vel_kmph = min(ref_vel_kmph, v_ref_acc)
 
-                    if self._loop % int(self._mpc_cfg.control_rate) == 0:
-                        self.get_logger().info(
-                            f"[ACC] Distance to opp: {opponent_distance:.2f}m, Opp speed: {opponent_v_lead:.2f}m/s. "
-                            f"Target speed limited to {ref_vel_kmph:.2f}m/s to maintain distance.",
-                            throttle_duration_sec=1.0
-                        )
+                    #if self._loop % int(self._mpc_cfg.control_rate) == 0:
+                        #self.get_logger().info(
+                        #    f"[ACC] Distance to opp: {opponent_distance:.2f}m, Opp speed: {opponent_v_lead:.2f}m/s. "
+                        #    f"Target speed limited to {ref_vel_kmph:.2f}m/s to maintain distance.",
+                        #    throttle_duration_sec=1.0
+                        #)
 
             # --- Emergency Proximity Brake (waypoint-independent) ---
             # opponent_ahead (waypoint差ベースの検出) に依存せず、全V2X車両を直接スキャンする。
@@ -2003,6 +2276,7 @@ class MPCController(Node):
             # 自車ヨー角を用いて「前方向」かどうかを判定する。
             EMERGENCY_BRAKE_DIST  = 6.0  # [m] この距離以内で前方に車がいたら緊急ブレーキ
             EMERGENCY_BRAKE_ANGLE = 60.0 # [deg] 前方判定の角度半幅（進行方向±この角度以内）
+            EMERGENCY_BRAKE_LATERAL_DIST = 1.2 # [m] 車線境界付近を含む横接近判定
             if hasattr(self, '_v2x_tracker'):
                 ego_yaw = pose.theta  # 自車ヨー角 [rad]
                 cos_thresh = math.cos(math.radians(EMERGENCY_BRAKE_ANGLE))
@@ -2017,16 +2291,80 @@ class MPCController(Node):
                             # 自車前方向ベクトルとの内積で「前方」を判定
                             fwd_dot = (dx * math.cos(ego_yaw) + dy * math.sin(ego_yaw)) / dist
                             if fwd_dot > cos_thresh:
+                                opp_wp_id = self._car.get_closest_waypoint(opp_x, opp_y)
+                                opp_wp = self._reference_path.get_waypoint(opp_wp_id)
+                                if opp_wp.normal_angle is not None:
+                                    nx = -math.cos(opp_wp.normal_angle)
+                                    ny = -math.sin(opp_wp.normal_angle)
+                                else:
+                                    normal_angle = opp_wp.psi + math.pi / 2.0
+                                    nx = math.cos(normal_angle)
+                                    ny = math.sin(normal_angle)
+
+                                ego_lateral_offset = (
+                                    (pose.x - opp_wp.x) * nx
+                                    + (pose.y - opp_wp.y) * ny
+                                )
+                                opp_lateral_offset = (
+                                    (opp_x - opp_wp.x) * nx
+                                    + (opp_y - opp_wp.y) * ny
+                                )
+                                lateral_dist = abs(
+                                    opp_lateral_offset - ego_lateral_offset)
+                                lanes = self._reference_path.get_lane_bounds(opp_wp_id)
+
+                                def lane_index(offset):
+                                    for index, (ub_lane, lb_lane) in enumerate(lanes):
+                                        if lb_lane <= offset <= ub_lane:
+                                            return index
+                                    return None
+
+                                ego_lane_idx = lane_index(ego_lateral_offset)
+                                opp_lane_idx = lane_index(opp_lateral_offset)
+                                same_lane = (
+                                    ego_lane_idx is not None
+                                    and ego_lane_idx == opp_lane_idx
+                                )
+                                laterally_close = (
+                                    lateral_dist < EMERGENCY_BRAKE_LATERAL_DIST)
+
+                                if not (same_lane or laterally_close):
+                                    self.get_logger().info(
+                                        "[EmergencyBrakeSkip] "
+                                        f"vehicle_id={vid} ego_lane={ego_lane_idx} "
+                                        f"opp_lane={opp_lane_idx} "
+                                        f"lateral={lateral_dist:.2f}m",
+                                        throttle_duration_sec=1.0,
+                                    )
+                                    continue
+
                                 opp_vx, opp_vy = self._v2x_tracker.velocity(vid)
                                 opp_spd = math.hypot(opp_vx, opp_vy)
+                                if (
+                                    forced_overtake_active
+                                    and vid == self._forced_overtake_vehicle_id
+                                ):
+                                    # The accepted outer-lane MPC path is the
+                                    # safety controller for this stopped target.
+                                    continue
                                 d_target_emg = 5.5
                                 K_p_emg = 1.5
                                 v_ref_emg = opp_spd + K_p_emg * (dist - d_target_emg)
-                                v_ref_emg = max(0.5, v_ref_emg)
+                                stopped_vehicle_too_close = (
+                                    opp_spd < self._stopped_lead_speed_threshold
+                                    and dist <= self._close_obstacle_reverse_distance
+                                )
+                                min_emergency_speed = (
+                                    0.0 if stopped_vehicle_too_close else 0.5)
+                                v_ref_emg = max(min_emergency_speed, v_ref_emg)
                                 ref_vel_kmph = min(ref_vel_kmph, v_ref_emg)
+                                emergency_brake_active = True
                                 self.get_logger().warn(
-                                    f"[EmergencyBrake] Forward obstacle at {dist:.2f}m "
-                                    f"(dot={fwd_dot:.2f}). Speed → {ref_vel_kmph:.2f}m/s",
+                                    f"[EmergencyBrake] vehicle_id={vid} "
+                                    f"forward obstacle at {dist:.2f}m "
+                                    f"(dot={fwd_dot:.2f}, lateral={lateral_dist:.2f}m, "
+                                    f"ego_lane={ego_lane_idx}, opp_lane={opp_lane_idx}). "
+                                    f"Speed → {ref_vel_kmph:.2f}m/s",
                                     throttle_duration_sec=0.5
                                 )
 
@@ -2078,13 +2416,19 @@ class MPCController(Node):
             LON_PARALLEL_MAX = 4.5   # [m] この縦距離以内を「並走」と判定
             PARALLEL_ABORT_SEC = 4.0 # [s] 並走がこの時間以上続いたら追い越し中断
 
+            parallel_vehicle_id = None
             if hasattr(self, '_v2x_tracker'):
                 for vid in self._v2x_tracker.active_vehicle_ids():
                     buf = self._v2x_tracker._samples.get(vid)
                     if buf:
                         _, opp_x, opp_y = buf[-1]
-                        lon_d = math.hypot(opp_x - pose.x, opp_y - pose.y)
-                        # 縦方向の距離（前後問わず）が LON_PARALLEL_MAX 以内の場合だけ横距離を計算
+                        dx = opp_x - pose.x
+                        dy = opp_y - pose.y
+                        lon_d = abs(
+                            dx * math.cos(pose.theta)
+                            + dy * math.sin(pose.theta)
+                        )
+                        # 進行方向の前後距離が近い場合だけ横距離を計算
                         if lon_d < LON_PARALLEL_MAX:
                             opp_wp_id = self._car.get_closest_waypoint(opp_x, opp_y)
                             opp_wp = self._reference_path.get_waypoint(opp_wp_id)
@@ -2095,14 +2439,19 @@ class MPCController(Node):
                                 a = opp_wp.psi + math.pi / 2.0
                                 nx = math.cos(a)
                                 ny = math.sin(a)
-                            lat_d = abs((opp_x - opp_wp.x) * nx + (opp_y - opp_wp.y) * ny)
+                            lat_d = abs(dx * nx + dy * ny)
                             if lat_d < parallel_lat_dist:
                                 parallel_lat_dist = lat_d
                                 parallel_lon_dist = lon_d
+                                parallel_vehicle_id = vid
 
             is_parallel = (parallel_lat_dist < LAT_WARN_THRESH and parallel_lon_dist < LON_PARALLEL_MAX)
+            forced_target_is_parallel = (
+                forced_overtake_active
+                and parallel_vehicle_id == self._forced_overtake_vehicle_id
+            )
 
-            if is_parallel:
+            if is_parallel and not forced_target_is_parallel:
                 if self._parallel_start_time is None:
                     self._parallel_start_time = current_time_sec
                 parallel_duration = current_time_sec - self._parallel_start_time
@@ -2114,7 +2463,9 @@ class MPCController(Node):
                     v_ref_parallel = ref_vel_kmph * (0.4 + 0.6 * ratio)  # 最大60%減速
                     ref_vel_kmph = min(ref_vel_kmph, v_ref_parallel)
                     self.get_logger().warn(
-                        f"[ParallelSafety] CRITICAL: lat={parallel_lat_dist:.2f}m, "
+                        f"[ParallelSafety] CRITICAL: vehicle_id={parallel_vehicle_id} "
+                        f"lat={parallel_lat_dist:.2f}m, "
+                        f"lon={parallel_lon_dist:.2f}m, "
                         f"speed limited to {ref_vel_kmph:.2f}m/s",
                         throttle_duration_sec=1.0
                     )
@@ -2124,27 +2475,52 @@ class MPCController(Node):
                     v_ref_parallel = ref_vel_kmph * (0.7 + 0.3 * ratio)  # 最大30%減速
                     ref_vel_kmph = min(ref_vel_kmph, v_ref_parallel)
                     self.get_logger().info(
-                        f"[ParallelSafety] WARNING: lat={parallel_lat_dist:.2f}m, "
+                        f"[ParallelSafety] WARNING: vehicle_id={parallel_vehicle_id} "
+                        f"lat={parallel_lat_dist:.2f}m, "
+                        f"lon={parallel_lon_dist:.2f}m, "
                         f"speed limited to {ref_vel_kmph:.2f}m/s (duration={parallel_duration:.1f}s)",
                         throttle_duration_sec=1.0
                     )
 
                 # 並走中断: 長時間並走が続いたら中央車線に戻して相手に先行させる
                 if parallel_duration > PARALLEL_ABORT_SEC and self._target_lane_idx is not None:
+                    '''
                     self.get_logger().warn(
-                        f"[ParallelSafety] ABORT overtake after {parallel_duration:.1f}s parallel running. "
+                        f"[ParallelSafety] ABORT: vehicle_id={parallel_vehicle_id} "
+                        f"lat={parallel_lat_dist:.2f}m, "
+                        f"lon={parallel_lon_dist:.2f}m, "
+                        f"after {parallel_duration:.1f}s parallel running. "
                         f"Returning to center lane.",
                         throttle_duration_sec=1.0
                     )
+                    '''
                     self._target_lane_idx = 1  # 中央車線へ退避
                     self._last_lane_change_time = current_time_sec
                     self._parallel_start_time = None
             else:
                 self._parallel_start_time = None
 
+            if forced_overtake_active:
+                ref_vel_kmph = min(
+                    ref_vel_kmph, self._forced_overtake_speed)
+
+            if close_overtake_blocked:
+                ref_vel_kmph = 0.0
+                self.get_logger().warn(
+                    "[StoppedVehicle] "
+                    f"vehicle_id={self._forced_overtake_vehicle_id} "
+                    f"distance={opponent_distance:.2f}m, "
+                    f"mpc_infeasible={self._mpc.infeasibility_counter}; "
+                    "holding speed at zero and waiting for reverse recovery.",
+                    throttle_duration_sec=1.0,
+                )
+
         self._mpc.update_v_max(ref_vel_kmph)
         v_ref: List[float] = [ref_vel_kmph] * len(self._reference_path.waypoints)
         self._reference_path.set_v_ref(v_ref)
+
+        if emergency_brake_active or self._close_obstacle_reverse_requested:
+            u[0] = min(u[0], ref_vel_kmph)
 
         # 停止命令がコマンドで入力させたら減速させる
         if not self._enable_control:
@@ -2170,7 +2546,7 @@ class MPCController(Node):
         if recovering_from_stuck:
             bug_acc_enabled = False
             if not self._stuck_reverse_drive_active:
-                acc = 0.0
+                acc = -8.0
             elif self._stuck_reverse_command_mode in ("negative_speed_positive_accel", "awsim_reverse_button"):
                 if self._stuck_reverse_acceleration_positive:
                     acc = abs(self._stuck_reverse_acceleration)
@@ -2189,11 +2565,31 @@ class MPCController(Node):
                 throttle_duration_sec=1.0,
             )
             self._pred_marker_color = YELLOW
+        elif emergency_brake_active or self._close_obstacle_reverse_requested:
+            bug_acc_enabled = False
+            acc = np.clip(
+                self.KP * (u[0] - abs(v)),
+                self._mpc_cfg.a_min,
+                self._mpc_cfg.a_max,
+            )
+            self._pred_marker_color = RED
         elif self.USE_BUG_ACC:
             def deg2rad(deg):
                 return deg * np.pi / 180.0
 
-            if abs(v) > kmh_to_m_per_sec(44.0) or \
+            forced_speed_error = u[0] - abs(v)
+            if (
+                forced_overtake_active
+                and forced_speed_error <= 0.3
+            ):
+                bug_acc_enabled = False
+                acc = np.clip(
+                    self.KP * forced_speed_error,
+                    self._mpc_cfg.a_min,
+                    self._mpc_cfg.a_max,
+                )
+                self._pred_marker_color = YELLOW
+            elif abs(v) > kmh_to_m_per_sec(44.0) or \
              (abs(v) > kmh_to_m_per_sec(38.0) and abs(max_delta) > deg2rad(12.0)):
                 bug_acc_enabled = False
                 acc = self._mpc_cfg.a_min / 3.0 * 2.0
@@ -2212,7 +2608,12 @@ class MPCController(Node):
 
         # 加速度と操舵角の平滑化
         if not recovering_from_stuck:
-            acc = self._last_acc + (acc - self._last_acc) * self._mpc_cfg.accel_low_pass_gain
+            # Safety braking must not be blended with a previous boost value.
+            if not (
+                emergency_brake_active
+                or self._close_obstacle_reverse_requested
+            ):
+                acc = self._last_acc + (acc - self._last_acc) * self._mpc_cfg.accel_low_pass_gain
             u[1] = self._last_u[1] + (u[1] - self._last_u[1]) * self._mpc_cfg.steer_low_pass_gain
 
         self._last_acc = acc
@@ -2231,8 +2632,14 @@ class MPCController(Node):
         self._sim_logger.plot_animation(t, self._loop, self._current_laps, self._lap_times, is_colliding, u, self._mpc, self._car)
 
         # 約 0.25 秒ごとに予測結果を表示
-        if (self._mpc.current_prediction is not None) and (self._loop % (self._mpc_cfg.control_rate // 4) == 0):
-            self._publish_mpc_pred_marker(self._mpc.current_prediction[0], self._mpc.current_prediction[1]) # type: ignore
+        if self._loop % (self._mpc_cfg.control_rate // 4) == 0:
+            if self._mpc.current_prediction is not None:
+                self._publish_mpc_pred_marker(
+                    self._mpc.current_prediction[0],
+                    self._mpc.current_prediction[1],
+                )
+            else:
+                self._clear_mpc_pred_markers()
 
         # 約 1 秒ごとに車線境界を表示
         if self._loop % int(self._mpc_cfg.control_rate) == 0:
