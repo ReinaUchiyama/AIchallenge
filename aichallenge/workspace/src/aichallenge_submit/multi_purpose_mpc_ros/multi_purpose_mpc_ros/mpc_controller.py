@@ -811,6 +811,14 @@ class MPCController(Node):
         self._hard_lane_narrow_confirm_cycles = 0
         self._outer_shadow_timeout_sec = max(float(getattr(
             switch_cfg, "outer_shadow_timeout_sec", 2.0)), 0.0)
+        self._outer_shadow_timeout_min_sec = max(float(getattr(
+            switch_cfg, "outer_shadow_timeout_min_sec", 0.6)), 0.0)
+        self._outer_shadow_timeout_approach_ref_mps = max(float(getattr(
+            switch_cfg, "outer_shadow_timeout_approach_ref_mps", 1.0)), 0.01)
+        self._outer_shadow_approach_speed_abort_mps = max(float(getattr(
+            switch_cfg, "outer_shadow_approach_speed_abort", 2.5)), 0.0)
+        self._outer_shadow_approach_abort_distance = max(float(getattr(
+            switch_cfg, "outer_shadow_approach_abort_distance", 8.0)), 0.0)
         self._outer_shadow_min_angle_margin = float(getattr(
             switch_cfg, "min_angle_margin_rad", -0.002))
         self._outer_shadow_min_rate_margin = float(getattr(
@@ -828,6 +836,13 @@ class MPCController(Node):
         self._outer_shadow_last_success_at = None
         self._outer_shadow_committed_lane_idx = None
         self._outer_shadow_committed_target_id = None
+        # Relative closing-speed tracking against the probed target, derived
+        # from consecutive _vehicle_passage() distance samples. Used to give
+        # up a hard-lane probe early (and shrink its timeout) when the
+        # opponent is approaching too fast for the probe to finish safely.
+        self._outer_shadow_last_distance = None
+        self._outer_shadow_last_distance_at = None
+        self._outer_shadow_approach_speed_mps = 0.0
         self._outer_failure_backoff = {0: None, 2: None}
         prepass_fallback_cfg = getattr(
             self._cfg, "prepass_lane_fallback", None)
@@ -3370,6 +3385,9 @@ class MPCController(Node):
         self._outer_shadow_retry_countdown = 0
         self._outer_shadow_last_probe_at = None
         self._outer_shadow_last_success_at = None
+        self._outer_shadow_last_distance = None
+        self._outer_shadow_last_distance_at = None
+        self._outer_shadow_approach_speed_mps = 0.0
         if clear_commit:
             self._outer_shadow_committed_lane_idx = None
             self._outer_shadow_committed_target_id = None
@@ -3491,10 +3509,64 @@ class MPCController(Node):
             float(now_sec) - self._outer_shadow_started_at
             if self._outer_shadow_started_at is not None else 0.0
         )
+
+        # Track how fast the probed target is closing on us, from successive
+        # _vehicle_passage() distance samples (same distance metric already
+        # used for the OvertakeLatch/Prepass gates elsewhere).
+        _, current_target_distance = self._vehicle_passage(
+            self._outer_shadow_target_id, predicted_pose)
+        closing_speed_mps = self._outer_shadow_approach_speed_mps
+        if current_target_distance is not None:
+            if (
+                self._outer_shadow_last_distance is not None
+                and self._outer_shadow_last_distance_at is not None
+            ):
+                dt = float(now_sec) - self._outer_shadow_last_distance_at
+                if dt > 1e-3:
+                    raw_closing_speed = (
+                        (self._outer_shadow_last_distance
+                         - current_target_distance) / dt
+                    )
+                    # Smooth against single noisy V2X samples rather than
+                    # reacting to one outlier frame.
+                    alpha = 0.5
+                    closing_speed_mps = (
+                        alpha * raw_closing_speed
+                        + (1.0 - alpha) * self._outer_shadow_approach_speed_mps
+                    )
+            self._outer_shadow_approach_speed_mps = closing_speed_mps
+            self._outer_shadow_last_distance = current_target_distance
+            self._outer_shadow_last_distance_at = float(now_sec)
+
+        # A fast-closing opponent leaves less real time for the probe to
+        # finish than outer_shadow_timeout_sec assumes at rest; shrink the
+        # effective timeout in proportion to the closing speed instead of
+        # always waiting the full budget while the gap keeps shrinking.
+        effective_timeout_sec = self._outer_shadow_timeout_sec
         if (
             self._outer_shadow_timeout_sec > 0.0
-            and elapsed >= self._outer_shadow_timeout_sec
+            and closing_speed_mps > self._outer_shadow_timeout_approach_ref_mps
         ):
+            scale = (
+                self._outer_shadow_timeout_approach_ref_mps
+                / closing_speed_mps
+            )
+            effective_timeout_sec = max(
+                self._outer_shadow_timeout_min_sec,
+                self._outer_shadow_timeout_sec * scale,
+            )
+
+        approach_abort = bool(
+            self._outer_shadow_approach_speed_abort_mps > 0.0
+            and closing_speed_mps >= self._outer_shadow_approach_speed_abort_mps
+            and current_target_distance is not None
+            and current_target_distance
+                <= self._outer_shadow_approach_abort_distance
+        )
+        timeout_hit = bool(
+            effective_timeout_sec > 0.0 and elapsed >= effective_timeout_sec
+        )
+        if approach_abort or timeout_hit:
             failed_target_id = self._outer_shadow_target_id
             failed_lane_idx = int(lane_idx)
             self._outer_failure_backoff[failed_lane_idx] = {
@@ -3517,11 +3589,27 @@ class MPCController(Node):
                 action = "starting full-width Prepass recovery"
             else:
                 action = "releasing the unconfirmed outer request"
-            self.get_logger().warn(
-                "[OuterLaneShadowTimeout] hard lane did not become feasible; "
-                f"vehicle_id={failed_target_id}, lane=L{failed_lane_idx}, "
-                f"elapsed={elapsed:.2f}s, action={action}"
-            )
+            if approach_abort:
+                self.get_logger().warn(
+                    "[OuterLaneShadowApproachAbort] hard lane probe "
+                    "abandoned early: opponent closing too fast for the "
+                    f"probe to finish; vehicle_id={failed_target_id}, "
+                    f"lane=L{failed_lane_idx}, "
+                    f"closing_speed={closing_speed_mps:.2f}m/s "
+                    f">= {self._outer_shadow_approach_speed_abort_mps:.2f}m/s, "
+                    f"distance={current_target_distance:.2f}m, "
+                    f"elapsed={elapsed:.2f}s, action={action}"
+                )
+            else:
+                self.get_logger().warn(
+                    "[OuterLaneShadowTimeout] hard lane did not become "
+                    f"feasible; vehicle_id={failed_target_id}, "
+                    f"lane=L{failed_lane_idx}, elapsed={elapsed:.2f}s/"
+                    f"{effective_timeout_sec:.2f}s "
+                    f"(base={self._outer_shadow_timeout_sec:.2f}s, "
+                    f"closing_speed={closing_speed_mps:.2f}m/s), "
+                    f"action={action}"
+                )
             return
         probe_allowed = bool(
             self._reference_path is self._reference_pathN_center
