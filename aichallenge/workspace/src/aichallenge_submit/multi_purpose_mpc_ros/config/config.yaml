@@ -54,6 +54,7 @@ trajectory_switch:
   overtake_latch_max_distance: 25.0 # [m] L0/L2の新規追い越しラッチを生成する最大実距離（この値未満のみ）
   overtake_release_distance: 28.0 # [m] ラッチ後はこの距離以上で解除候補とし、28m開始とのヒステリシスを持たせる
   overtake_release_confirm_sec: 0.5 # [s] 30m以上が連続した場合だけ通常追い越し/Prepassを解除
+  overtake_target_switch_margin_m: 3.0 # [m] 現在ロック中の対象より、この値以上近い候補にしか追い越し対象を切り替えない（対象の高頻度な往復切り替えを防ぐヒステリシス）
   center_lane_rejoin_behind_wps: 6 # 追い越した車が後方へこの差以上 離れたらCenter軌道のL1へ戻る
   behind_release_wps: 12 # 追い越した車が後方へこの差以上離れるまで維持
   min_hold_sec: 1.0      # 切り替え直後の再切り替え禁止時間
@@ -106,7 +107,7 @@ prepass_lane_fallback:
   follow_target_lost_max_speed: 1.0 # [m/s] 消失保持中の速度上限（保持期限後は一度停止して全車両再評価）
 
 follow_control:
-  follow_only: false       # true: L0/L2へ追い越さず、Center軌道のL1で追従する
+  follow_only: true      # true: L0/L2へ追い越さず、Center軌道のL1で追従する
   engage_distance: 15.0  # [m] この距離未満で車間制御を有効化
   desired_distance: 8.0  # [m] 目標車間距離
   lateral_distance: 1.2  # [m] 同一車線とみなす横方向距離
@@ -175,14 +176,28 @@ mpc:
   # accel_low_pass_gain: 0.1
   # steer_low_pass_gain: 0.3
   accel_low_pass_gain: 0.2
-  steer_low_pass_gain: 0.8
+  steer_low_pass_gain: 1.0
   # 遅延後の姿勢を予測するため、固定Waypoint先読みは重ねない。
   wp_id_offset: 0
   # 送信済み操舵指令がアクチュエータへ到達するまでの姿勢を予測する。
   delay_prediction_enabled: true
-  steering_command_delay: 0.15 # [s]
+  steering_command_delay: 0.15 # [s] steering_delay_estimation_enabled時はオンライン推定値で上書きされる初期値
   delay_prediction_steer_gain: 1.0004
   delay_prediction_steps: 7
+  # --- 操舵応答遅延のオンライン推定 (measure_steering_response.py の相互相関ラグ探索を移植) ---
+  # 実測で速度・MPC状態により遅延が150〜220ms程度変動することが分かったため、
+  # 固定値ではなく /vehicle/status/steering_status の実測フィードバックから追従させる。
+  steering_delay_estimation_enabled: true
+  steering_delay_window_sec: 5.0 # [s] 相関計算に使う直近ウィンドウ長
+  steering_delay_estimate_period_sec: 0.25 # [s] 推定の実行間隔 (4Hz)
+  steering_delay_resample_period_sec: 0.01 # [s] 相関計算用のリサンプル周期
+  steering_delay_max_lag_sec: 0.40 # [s] 探索するラグの上限
+  steering_delay_min_samples: 150 # 相関計算に必要な最小リサンプル点数
+  steering_delay_min_command_std_rad: 0.015 # [rad] これ未満の操舵変化しかない窓は推定をスキップ
+  steering_delay_min_correlation: 0.5 # これ未満の相関係数の推定は信頼せず破棄
+  steering_delay_min_sec: 0.05 # [s] 推定値のクランプ下限
+  steering_delay_max_sec: 0.35 # [s] 推定値のクランプ上限
+  steering_delay_smoothing_tau_sec: 1.5 # [s] EMA平滑化の時定数 (急変で予測が暴れるのを防ぐ)
   # 単一点previewではなく、150ms先の曲率要求から0.60rad/sで到達可能な
   # 操舵ランプを弧長方向へ後方伝播する予約列方式を使用する。
   steering_preview_enabled: false
@@ -199,7 +214,7 @@ mpc:
   ## Lap1: 53s, Lap2: 47s
 
   v_max: 35.0   # km/h
-  ay_max: 12.0  # m/s^2, maximum lateral acceleration in curves
+  ay_max: 18.0  # m/s^2, maximum lateral acceleration in curves
   # kappa_actual = kappa_cmd / (1 + understeer_coeff * v^2)
   # 0.002 gives about 16% curvature loss at 35 km/h.
   understeer_coeff: 0.002  # [s^2/m^2]

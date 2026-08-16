@@ -42,6 +42,10 @@ except (ModuleNotFoundError, ImportError):
     ControlModeReport = None
     VelocityReport = None
 try:
+    from autoware_auto_vehicle_msgs.msg import SteeringReport
+except (ModuleNotFoundError, ImportError):
+    SteeringReport = None
+try:
     from tier4_vehicle_msgs.msg import ActuationCommandStamped
 except ModuleNotFoundError:
     ActuationCommandStamped = None
@@ -647,9 +651,52 @@ class MPCController(Node):
             float(getattr(cfg_mpc, "delay_prediction_steer_gain", 1.0)), 0.0)
         self._delay_prediction_steps = max(
             int(getattr(cfg_mpc, "delay_prediction_steps", 9)), 1)
+        # --- 操舵応答遅延のオンライン推定 (measure_steering_response.py の
+        # 相互相関ラグ探索を移植) ---
+        # 実測では速度・MPC状態によって遅延が150〜220ms程度変動することが
+        # 分かっているため、固定値ではなく実測フィードバックから追従させる。
+        # 相関計算自体は数百サンプル×数十ラグの積和なので、制御周期(40Hz,
+        # QPソルブに数ms〜数十ms)に対して無視できるほど軽い。
+        self._steering_delay_estimation_enabled = bool(getattr(
+            cfg_mpc, "steering_delay_estimation_enabled", False))
+        self._steering_delay_window_sec = max(float(getattr(
+            cfg_mpc, "steering_delay_window_sec", 5.0)), 0.5)
+        self._steering_delay_estimate_period_sec = max(float(getattr(
+            cfg_mpc, "steering_delay_estimate_period_sec", 0.25)), 0.02)
+        self._steering_delay_resample_period_sec = max(float(getattr(
+            cfg_mpc, "steering_delay_resample_period_sec", 0.01)), 0.001)
+        self._steering_delay_max_lag_sec = max(float(getattr(
+            cfg_mpc, "steering_delay_max_lag_sec", 0.40)), 0.05)
+        self._steering_delay_min_samples = max(int(getattr(
+            cfg_mpc, "steering_delay_min_samples", 150)), 10)
+        self._steering_delay_min_command_std_rad = max(float(getattr(
+            cfg_mpc, "steering_delay_min_command_std_rad", 0.015)), 0.0)
+        self._steering_delay_min_correlation = max(float(getattr(
+            cfg_mpc, "steering_delay_min_correlation", 0.5)), 0.0)
+        self._steering_delay_min_sec = max(float(getattr(
+            cfg_mpc, "steering_delay_min_sec", 0.05)), 0.0)
+        self._steering_delay_max_sec = max(float(getattr(
+            cfg_mpc, "steering_delay_max_sec", 0.35)),
+            self._steering_delay_min_sec)
+        # EMA平滑化の時定数。急変で予測が暴れないよう、1推定あたり一気に
+        # 反映せず徐々に追従させる。
+        self._steering_delay_smoothing_tau_sec = max(float(getattr(
+            cfg_mpc, "steering_delay_smoothing_tau_sec", 1.5)), 0.0)
+        # 実測トピックの周期に関わらず十分な余裕を持たせた固定上限
+        # (実際の保持範囲は _steering_status_callback 内で時間ベースに刈り込む)。
+        self._steering_status_history = deque(maxlen=4000)
+        self._steering_delay_last_update_sec: Optional[float] = None
+
+        # コマンド側の履歴は (a) 遅延補償姿勢予測での参照、(b) 相互相関による
+        # 遅延推定、の両方に使うため、両方の必要長のうち長い方を確保する。
+        delay_prediction_span_sec = self._steering_command_delay + 1.0
+        estimation_span_sec = (
+            self._steering_delay_window_sec + self._steering_delay_max_lag_sec
+            if self._steering_delay_estimation_enabled else 0.0
+        )
         history_length = max(
             int(self._mpc_cfg.control_rate *
-                (self._steering_command_delay + 1.0)),
+                max(delay_prediction_span_sec, estimation_span_sec)),
             self._delay_prediction_steps + 2,
         )
         self._steering_command_history = deque(maxlen=history_length)
@@ -689,6 +736,8 @@ class MPCController(Node):
             self._overtake_latch_max_distance)
         self._overtake_release_confirm_sec = max(float(getattr(
             switch_cfg, "overtake_release_confirm_sec", 0.5)), 0.0)
+        self._overtake_target_switch_margin_m = max(float(getattr(
+            switch_cfg, "overtake_target_switch_margin_m", 3.0)), 0.0)
         self._ordinary_overtake_distance_exit_since = None
         self._ordinary_overtake_distance_exit_target_id = None
         self._prepass_distance_exit_since = None
@@ -1387,6 +1436,22 @@ class MPCController(Node):
                 self._velocity_status_callback,
                 1,
             )
+        if SteeringReport is not None and self._steering_delay_estimation_enabled:
+            self._steering_status_sub = self.create_subscription(
+                SteeringReport,
+                "/vehicle/status/steering_status",
+                self._steering_status_callback,
+                50,
+            )
+            self._steering_delay_estimate_timer = self.create_timer(
+                self._steering_delay_estimate_period_sec,
+                self._update_steering_delay_estimate,
+            )
+        elif self._steering_delay_estimation_enabled:
+            self.get_logger().warn(
+                "autoware_auto_vehicle_msgs/SteeringReport is unavailable; "
+                "adaptive steering_command_delay estimation is disabled."
+            )
 
         if self.USE_OBSTACLE_AVOIDANCE:
             if self._cfg.reference_path.use_path_constraints_topic: # type: ignore
@@ -1545,6 +1610,129 @@ class MPCController(Node):
 
     def _velocity_status_callback(self, msg) -> None:
         self._velocity_report = msg
+
+    def _steering_status_callback(self, msg) -> None:
+        """Record measured tire angle for the delay cross-correlation.
+
+        Both the command and status samples are timestamped on reception by
+        this node (not by their message header stamps) so they share one
+        common clock, matching measure_steering_response.py.
+        """
+        now_sec = self.get_clock().now().nanoseconds / 1e9
+        self._steering_status_history.append(
+            (now_sec, float(msg.steering_tire_angle)))
+        oldest = now_sec - self._steering_delay_window_sec - self._steering_delay_max_lag_sec
+        while (
+            self._steering_status_history
+            and self._steering_status_history[0][0] < oldest
+        ):
+            self._steering_status_history.popleft()
+
+    @staticmethod
+    def _steering_delay_interpolate(samples, times):
+        sample_times = np.asarray([sample[0] for sample in samples])
+        sample_values = np.asarray([sample[1] for sample in samples])
+        return np.interp(times, sample_times, sample_values)
+
+    @staticmethod
+    def _steering_delay_normalized_correlation(a, b):
+        a = a - np.mean(a)
+        b = b - np.mean(b)
+        denom = math.sqrt(float(np.dot(a, a) * np.dot(b, b)))
+        if denom < 1e-12:
+            return float('nan')
+        return float(np.dot(a, b) / denom)
+
+    def _update_steering_delay_estimate(self) -> None:
+        """Cross-correlate recent command/status waveforms to track the
+        actual steer-to-tire delay (measured 150-220ms depending on speed
+        and MPC state, per operator report), instead of trusting the fixed
+        steering_command_delay config value.
+
+        Ported from measure_steering_response.py's lag search. The window is
+        shorter (default 5s vs. 8s) and this runs more often (default 4Hz vs.
+        1Hz) so the estimate tracks changing conditions faster; the
+        correlation itself is O(window_samples * lag_candidates), a few
+        thousand multiply-adds per call, negligible next to the MPC solve.
+        """
+        command_history = self._steering_command_history
+        status_history = self._steering_status_history
+        if len(command_history) < 2 or len(status_history) < 2:
+            return
+
+        now_sec = self.get_clock().now().nanoseconds / 1e9
+        max_lag = self._steering_delay_max_lag_sec
+        start = max(
+            command_history[0][0],
+            status_history[0][0] - max_lag,
+            now_sec - self._steering_delay_window_sec,
+        )
+        end = min(command_history[-1][0], status_history[-1][0]) - max_lag
+        if end <= start:
+            return
+
+        step = self._steering_delay_resample_period_sec
+        command_times = np.arange(start, end, step)
+        if command_times.size < self._steering_delay_min_samples:
+            return
+
+        command = self._steering_delay_interpolate(command_history, command_times)
+        command_std = float(np.std(command))
+        if command_std < self._steering_delay_min_command_std_rad:
+            # Not enough steering excitation this window (e.g. near-straight
+            # driving) to estimate a reliable lag; keep the previous value.
+            return
+
+        lag_steps = int(round(max_lag / step))
+        lags = np.arange(lag_steps + 1) * step
+        command_centered = command - np.mean(command)
+        best_lag = None
+        best_correlation = -2.0
+        for lag in lags:
+            status = self._steering_delay_interpolate(
+                status_history, command_times + lag)
+            correlation = self._steering_delay_normalized_correlation(command, status)
+            if math.isfinite(correlation) and correlation > best_correlation:
+                best_correlation = correlation
+                best_lag = float(lag)
+
+        if best_lag is None or best_correlation < self._steering_delay_min_correlation:
+            return
+
+        best_lag = min(max(best_lag, self._steering_delay_min_sec),
+                        self._steering_delay_max_sec)
+
+        # EMA smoothing so a single noisy estimate cannot jerk the
+        # delay-compensated pose prediction around.
+        if (
+            self._steering_delay_smoothing_tau_sec <= 0.0
+            or self._steering_delay_last_update_sec is None
+        ):
+            smoothed = best_lag
+        else:
+            dt = max(now_sec - self._steering_delay_last_update_sec, 0.0)
+            alpha = 1.0 - math.exp(-dt / self._steering_delay_smoothing_tau_sec)
+            smoothed = (
+                self._steering_command_delay
+                + alpha * (best_lag - self._steering_command_delay)
+            )
+        self._steering_delay_last_update_sec = now_sec
+
+        previous = self._steering_command_delay
+        self._steering_command_delay = smoothed
+        # steering_command_delay is read fresh on every solve by MPC.py (it
+        # is not baked into any precomputed matrix), so updating the
+        # attribute on each live MPC instance is all that is needed.
+        for mpc in (self._mpcN_race, self._mpcN_center, self._mpcN_outer_lane_probe):
+            if mpc is not None:
+                mpc.steering_command_delay = smoothed
+        if abs(smoothed - previous) > 0.005:
+            self.get_logger().info(
+                "[SteeringDelayEstimate] "
+                f"raw={best_lag * 1000:.0f}ms smoothed={smoothed * 1000:.0f}ms "
+                f"corr={best_correlation:.3f} cmd_std={command_std:.4f}rad "
+                f"n={command_times.size}"
+            )
 
     def _awsim_state_callback(self, msg) -> None:
         previous_state = self._awsim_state
@@ -6207,6 +6395,23 @@ class MPCController(Node):
             if self._overtake_target_vehicle_id is not None
             else self._forced_overtake_vehicle_id
         )
+        # Distance of the currently latched target, used only to require a
+        # clear advantage before a different relevant lead may replace it
+        # (see should_reset_overtake_latch_for_target_change docstring).
+        # None when the active target is no longer a valid forward lead, in
+        # which case the hysteresis is skipped and the switch proceeds as
+        # before.
+        active_target_distance = None
+        if active_overtake_target_id is not None:
+            active_buf = self._v2x_tracker._samples.get(
+                active_overtake_target_id)
+            if active_buf:
+                _, active_opp_x, active_opp_y = active_buf[-1]
+                active_rel_forward = self._center_longitudinal_between(
+                    pose.x, pose.y, active_opp_x, active_opp_y)
+                if active_rel_forward is not None and active_rel_forward > 0.0:
+                    active_target_distance = math.hypot(
+                        active_opp_x - pose.x, active_opp_y - pose.y)
         if should_reset_overtake_latch_for_target_change(
             active_target_id=active_overtake_target_id,
             candidate_target_id=opponent_vehicle_id,
@@ -6220,6 +6425,9 @@ class MPCController(Node):
                     )
                 )
             ),
+            active_target_distance=active_target_distance,
+            candidate_target_distance=opponent_distance,
+            switch_margin_m=self._overtake_target_switch_margin_m,
         ):
             old_target_id = active_overtake_target_id
             self._reset_overtake_state_for_target_change(

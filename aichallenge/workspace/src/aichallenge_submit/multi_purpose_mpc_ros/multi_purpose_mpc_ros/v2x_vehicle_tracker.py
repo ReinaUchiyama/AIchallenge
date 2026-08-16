@@ -405,19 +405,45 @@ def is_follow_target_ahead(longitudinal) -> bool:
 
 
 def should_reset_overtake_latch_for_target_change(
-    *, active_target_id, candidate_target_id, candidate_is_relevant
+    *,
+    active_target_id,
+    candidate_target_id,
+    candidate_is_relevant,
+    active_target_distance=None,
+    candidate_target_distance=None,
+    switch_margin_m: float = 0.0,
 ) -> bool:
     """Return whether a newly selected relevant lead replaces an old target.
 
     Passing-side latches are deliberately sticky during one manoeuvre.  A
     different nearby/stopped vehicle is a new manoeuvre, however, and must not
     inherit the previous target's L0/L2 decision.
+
+    When two opponents are near-equidistant (e.g. running side by side), the
+    plain "any different relevant lead wins" rule made the target flip back
+    and forth every cycle, tearing the lane-change/hard-lane-probe state
+    machine down and rebuilding it many times per second. To damp that, a
+    candidate only replaces the active target if it is closer by at least
+    ``switch_margin_m``. If either distance is unavailable/non-finite the
+    hysteresis cannot be evaluated, so the switch is allowed (this also keeps
+    behaviour unchanged when the active target has been lost).
     """
-    return bool(
+    if not bool(
         candidate_is_relevant
         and candidate_target_id is not None
         and active_target_id is not None
         and candidate_target_id != active_target_id
+    ):
+        return False
+    if (
+        active_target_distance is None
+        or candidate_target_distance is None
+        or not math.isfinite(float(active_target_distance))
+        or not math.isfinite(float(candidate_target_distance))
+    ):
+        return True
+    return float(candidate_target_distance) <= (
+        float(active_target_distance) - float(switch_margin_m)
     )
 
 
