@@ -56,7 +56,6 @@ v2x_obstacle_avoidance:
   vehicle_radius: 0.5          # [m]
   v_max_safety: 40.0           # [m/s]
   position_jump_threshold: 5.0 # [m]
-  sample_freshness_sec: 1.0    # [s] この時間更新が無い車両は動的障害物として消去する
 
 stuck_recovery:
   enabled: true

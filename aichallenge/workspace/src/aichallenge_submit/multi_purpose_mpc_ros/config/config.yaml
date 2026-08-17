@@ -8,11 +8,10 @@ map:
   # path from pkg share dir
   yaml_path: "env/min_curv/occupancy_grid_map.yaml"
 
-
 waypoints:
   # path from pkg share dir
   # csv_path: "maps/occupancy_grid_map_waypoints.csv"
-  csv_path: "env/centerline/waypoint_bounds_center_mincurv_capped.csv"
+  csv_path: "env/centerline/waypoint_bounds_center.csv"
 
 obstacles:
   # path from pkg share dir
@@ -25,7 +24,7 @@ reference_path:
   # path from pkg share dir
   # csv_path: ""
   # csv_path は追い越し・追従フラグ時（center セット）に使用する軌道
-  csv_path: "env/centerline/traj_center_mincurv_capped.csv"
+  csv_path: "env/centerline/traj_center313.csv"
 
   # --- 軌道・境界線CSVの切り替え設定 ---
   # 通常走行時（追い越し・追従フラグなし）に使用するレースライン軌道
@@ -34,9 +33,10 @@ reference_path:
   race_bounds_csv_path: "env/min_curv2/waypoint_bounds.csv"
 
   # 追い越し・追従フラグ時に使用する安定化軌道（センターライン）
-  center_csv_path: "env/centerline/traj_center_mincurv_capped.csv"
+  center_csv_path: "env/centerline/traj_center313.csv"
   # 追い越し・追従フラグ時の境界線CSV（センターライン基準）
-  center_bounds_csv_path: "env/centerline/waypoint_bounds_center_mincurv_capped.csv"
+  center_bounds_csv_path: "env/centerline/waypoint_bounds_center.csv"
+
   resolution: 0.6
   smoothing_distance: 2
   #(ref_max_width / 2.0 + self._v2x_vehicle_radius + 0.5) ** 2
@@ -51,10 +51,9 @@ reference_path:
 trajectory_switch:
   enter_center_wps: 20   # 前方車がこのWaypoint差未満ならCenterへ切り替え
   exit_center_wps: 25    # Center中はこのWaypoint差を超えるまで維持
-  overtake_latch_max_distance: 25.0 # [m] L0/L2の新規追い越しラッチを生成する最大実距離（この値未満のみ）
-  overtake_release_distance: 28.0 # [m] ラッチ後はこの距離以上で解除候補とし、28m開始とのヒステリシスを持たせる
-  overtake_release_confirm_sec: 0.5 # [s] 30m以上が連続した場合だけ通常追い越し/Prepassを解除
-  overtake_target_switch_margin_m: 3.0 # [m] 現在ロック中の対象より、この値以上近い候補にしか追い越し対象を切り替えない（対象の高頻度な往復切り替えを防ぐヒステリシス）
+  overtake_latch_max_distance: 15.0 # [m] L0/L2の新規追い越しラッチを生成する最大実距離（この値未満のみ）
+  overtake_release_distance: 20.0 # [m] ラッチ後は20m以上で解除し、15m開始とのヒステリシスを持たせる
+  overtake_target_switch_margin_m: 3.0 # [m] 現在対象よりこの距離以上近い候補にだけ切り替える
   center_lane_rejoin_behind_wps: 6 # 追い越した車が後方へこの差以上 離れたらCenter軌道のL1へ戻る
   behind_release_wps: 12 # 追い越した車が後方へこの差以上離れるまで維持
   min_hold_sec: 1.0      # 切り替え直後の再切り替え禁止時間
@@ -63,29 +62,6 @@ trajectory_switch:
   race_rejoin_max_heading_deg: 10.0 # Race/Centerの方位差がこれ以下の地点でRaceへ復帰
   outer_lane_release_infeasible_cycles: 5 # 追越し後、対象が後方にいる状態でこの回数連続失敗したらL0/L2固定を解除
   outer_lane_release_behind_m: 0.5 # 追越し後、対象が進行方向への射影でこの距離以上後方なら解除を許可
-  outer_shadow_success_cycles: 3 # L0/L2操舵状態MPCがこの回数連続成功してから実制御へハード制約を適用
-  outer_shadow_retry_interval_cycles: 3 # Shadow失敗中の再試行間隔（制御周期）
-  outer_shadow_rate_hz: 10.0 # Shadow solveの上限周期。実制御MPCの後段でのみ実行
-  outer_shadow_live_total_budget_ms: 15.0 # 実制御MPCがこの時間を超えた周期はShadowをスキップ
-  outer_shadow_max_infeasible_retries: 1 # Shadowは初回solveに加えて最大1回だけ緩和再試行
-  outer_shadow_success_hold_sec: 0.30 # 負荷都合のスキップ中に直近の成功列を保持する時間
-  outer_shadow_result_max_age_sec: 0.15 # Commitに混ぜてよい直前Shadow成功結果の最大鮮度
-  outer_shadow_timeout_sec: 2.0 # [s] 成立しなければ失敗車線として全幅Prepass回復へ移行
-  outer_shadow_timeout_min_sec: 0.6 # [s] 接近速度に応じて動的短縮するタイムアウトの下限
-  outer_shadow_timeout_approach_ref_mps: 1.0 # [m/s] この接近速度を超えた分だけタイムアウトを比例的に短縮する基準値
-  outer_shadow_approach_speed_abort: 2.5 # [m/s] 対象車との接近速度がこれ以上かつ下記距離以内ならプローブを即座に諦める
-  outer_shadow_approach_abort_distance: 8.0 # [m] 上の接近速度による早期中断を有効にする最大距離
-  hard_lane_predictive_release_width: 1.1 # [m] 予測区間でこの幅未満が連続したらハード車線制約を予防解除
-  hard_lane_predictive_release_points: 3 # 警戒幅未満を要求する連続予測点数
-  hard_lane_predictive_confirm_cycles: 2 # 予防解除条件を要求する連続制御周期数
-  hard_lane_critical_release_width: 0.8 # [m] 直近予測点がこの幅未満なら確認待ちせず即時解除
-  hard_lane_critical_lookahead_points: 5 # 即時解除を監視する現在側の予測点数
-  hard_lane_reapply_min_width: 1.3 # [m] Shadowでハード外側車線を再適用する最低予測幅
-  hard_lane_release_speed_cap: 3.0 # [m/s] 即時解除周期の速度上限
-  min_angle_margin_rad: -0.002 # [rad] Shadow診断のステア角余裕に許容する数値誤差（QP制約は緩和しない）
-  min_rate_margin_rad: -0.001 # [rad/s] Shadow診断のステアレート余裕に許容する数値誤差
-  outer_failure_backoff_sec: 1.0 # [s] Shadow失敗車線の即時再選択を禁止
-  outer_failure_backoff_wps: 8 # 時間前でもこのWaypoint数を進めば再評価
 
 prepass_lane_fallback:
   enabled: true
@@ -93,7 +69,7 @@ prepass_lane_fallback:
   recovery_stable_sec: 0.5 # 全幅解除後、MPC正常かつ候補車線基準の車両安定条件がこの時間続いてから代替車線を選択
   recovery_timeout_sec: 5.0 # 全幅回復がこの時間成立しなければラッチ対象を再評価。通過不可/後方危険なら追従、近すぎて通過可能なら後退後に再評価
   follow_retry_sec: 2.0 # [s] 追従へ移行後も、この周期で外側車線の通過幅とV2X競合を再評価する
-  follow_retry_max_distance: 25.0 # [m] 追従から追い越しを再評価する最大距離（この値未満のみ）
+  follow_retry_max_distance: 15.0 # [m] 追従から追い越しを再評価する最大距離（この値未満のみ）
   behind_release_longitudinal: 0.5 # [m] 対象がこの距離より後方にいる状態が継続したらPrepassを解除
   behind_release_confirm_sec: 0.25 # [s] V2X位置揺れで誤解除しないための後方判定継続時間
   max_heading_error_deg: 10.0 # [deg] 候補車線中心軌道に対するPrepass回復時の許容方位誤差
@@ -107,7 +83,7 @@ prepass_lane_fallback:
   follow_target_lost_max_speed: 1.0 # [m/s] 消失保持中の速度上限（保持期限後は一度停止して全車両再評価）
 
 follow_control:
-  follow_only: true      # true: L0/L2へ追い越さず、Center軌道のL1で追従する
+  follow_only: false       # true: L0/L2へ追い越さず、Center軌道のL1で追従する
   engage_distance: 15.0  # [m] この距離未満で車間制御を有効化
   desired_distance: 8.0  # [m] 目標車間距離
   lateral_distance: 1.2  # [m] 同一車線とみなす横方向距離
@@ -153,22 +129,15 @@ mpc:
   # Q: [e_y(横ずれ), e_psi(ヨー角ずれ), t]
   # R: [v, delta]
   # QN: [e_y, e_psi, t]
-  R: [100000.0, 500.0]
+  R: [100000.0, 1000.0]
   R10: [100000.0,100.0]
   a_min: -2.0 # m/s^2
   a_max: 2.5 # m/s^2
   delta_max_deg: 18.0 # degrees
-  steer_rate_max: 0.60 # [rad/s] AWSIMで実測した物理タイヤ角速度上限
-  # Steering-state MPC: x=[e_y,e_psi,t,delta], u=[v,delta_rate].
-  # steer_rate_max is a physical tire-angle rate [rad/s] in both MPC and AWSIM.
-  steering_state_weight: 50000.0
-  terminal_steering_state_weight: 50000.0
+  steer_rate_max: 1.00 # rad/s max_steering_rate
   control_rate: 40.0 # Hz Ts=1/control_rate
-  solve_time_budget_ms: 30.0 # 初回失敗後、安全マージンを緩和する追加再試行だけの時間上限
-  max_prediction_fallback_cycles: 4 # 古い予測・制御列を再利用できる最大連続失敗周期
-  diagnostic_log_interval_cycles: 80 # 正常時の構造化MPC診断ログ間隔（失敗時は即時出力）
-  prediction_outer_boundary_guard: 0.10 # [m] L0/L2/全幅の物理外周境界から予測車両中心を追加で離す
-  prediction_lateral_tolerance: 0.02 # [m] OSQP数値誤差として解採用時に許容する境界違反
+  solve_time_budget_ms: 20.0 # 初回失敗後、安全マージンを緩和する追加再試行だけの時間上限
+  max_prediction_fallback_cycles: 3 # 古い予測・制御列を再利用できる最大連続失敗周期
   safety_recovery_speed: 1.0 # [m/s] 古い予測破棄後の全幅MPC回復中の上限速度
   safety_recovery_success_sec: 0.5 # [s] 全幅MPCが連続成功してから通常車線選択へ戻す時間
   #steering_tire_angle_gain_var: 1.639
@@ -181,33 +150,13 @@ mpc:
   wp_id_offset: 0
   # 送信済み操舵指令がアクチュエータへ到達するまでの姿勢を予測する。
   delay_prediction_enabled: true
-  steering_command_delay: 0.15 # [s] steering_delay_estimation_enabled時はオンライン推定値で上書きされる初期値
+  steering_command_delay: 0.15 # [s]
   delay_prediction_steer_gain: 1.0004
   delay_prediction_steps: 7
-  # --- 操舵応答遅延のオンライン推定 (measure_steering_response.py の相互相関ラグ探索を移植) ---
-  # 実測で速度・MPC状態により遅延が150〜220ms程度変動することが分かったため、
-  # 固定値ではなく /vehicle/status/steering_status の実測フィードバックから追従させる。
-  steering_delay_estimation_enabled: true
-  steering_delay_window_sec: 5.0 # [s] 相関計算に使う直近ウィンドウ長
-  steering_delay_estimate_period_sec: 0.25 # [s] 推定の実行間隔 (4Hz)
-  steering_delay_resample_period_sec: 0.01 # [s] 相関計算用のリサンプル周期
-  steering_delay_max_lag_sec: 0.40 # [s] 探索するラグの上限
-  steering_delay_min_samples: 150 # 相関計算に必要な最小リサンプル点数
-  steering_delay_min_command_std_rad: 0.015 # [rad] これ未満の操舵変化しかない窓は推定をスキップ
-  steering_delay_min_correlation: 0.5 # これ未満の相関係数の推定は信頼せず破棄
-  steering_delay_min_sec: 0.05 # [s] 推定値のクランプ下限
-  steering_delay_max_sec: 0.35 # [s] 推定値のクランプ上限
-  steering_delay_smoothing_tau_sec: 1.5 # [s] EMA平滑化の時定数 (急変で予測が暴れるのを防ぐ)
-  # 単一点previewではなく、150ms先の曲率要求から0.60rad/sで到達可能な
-  # 操舵ランプを弧長方向へ後方伝播する予約列方式を使用する。
-  steering_preview_enabled: false
-  steering_preview_max_distance: 6.0
-  steering_reservation_enabled: false
-  steering_reachability_speed_enabled: false
-  steering_reachability_min_speed: 2.0
-  steering_reachability_min_angle: 0.03
   use_max_kappa_pred: false
   osqp_initialized: false #setup済みならtrueに
+  prediction_outer_boundary_guard: 0.10 # [m] 物理外周境界から予測車両中心を追加で離す
+  prediction_lateral_tolerance: 0.02 # [m] OSQP解採用時に許容する境界違反
 
 
   ## ---------- 究極 ------------- ##
@@ -217,7 +166,7 @@ mpc:
   ay_max: 18.0  # m/s^2, maximum lateral acceleration in curves
   # kappa_actual = kappa_cmd / (1 + understeer_coeff * v^2)
   # 0.002 gives about 16% curvature loss at 35 km/h.
-  understeer_coeff: 0.002  # [s^2/m^2]
+  understeer_coeff: 0.005  # [s^2/m^2]
   Q: [3000000.0, 55000000.0, 2000000.0]
   QN: [1000000.0, 1000000.0, 10000.0]
 
@@ -262,9 +211,8 @@ mpc:
 
 v2x_obstacle_avoidance:
   vehicle_radius: 0.725          # [m]
-  v_max_safety: 40.0           # [m/s]
+  v_max_safety: 35.0           # [m/s]
   position_jump_threshold: 5.0 # [m]
-  sample_freshness_sec: 1.0    # [s] この時間更新が無い車両は動的障害物として消去する
   parallel_vehicle_half_width: 0.725 # [m] 並走横クリアランス用の相手車両半幅
   parallel_ego_half_length: 1.0     # [m] 自車の全長2.0mに対する半長
   parallel_vehicle_half_length: 1.0 # [m] 相手車の全長2.0mに対する半長

@@ -7,7 +7,6 @@ and reusable from non-ROS contexts (e.g. offline replay of rosbag CSVs).
 """
 
 import math
-import time
 from collections import deque
 from typing import Deque, Dict, List, Tuple
 
@@ -206,21 +205,6 @@ def _stamp_to_seconds(stamp) -> float:
     return float(stamp.sec) + float(stamp.nanosec) * 1e-9
 
 
-def is_sample_fresh(last_seen, now: float, sample_freshness_sec: float) -> bool:
-    """Return whether a sample last received at ``last_seen`` is still fresh.
-
-    ``last_seen`` is the local reception time (not the payload's own
-    timestamp) of the most recent sample for a vehicle, as recorded by
-    :meth:`V2XVehicleTracker.update`. A vehicle that was never received
-    (``last_seen is None``) is never fresh. A negative or zero
-    ``sample_freshness_sec`` degenerates to "never fresh" rather than raising,
-    so callers can disable freshness checking via config without crashing.
-    """
-    if last_seen is None:
-        return False
-    return (float(now) - float(last_seen)) <= max(float(sample_freshness_sec), 0.0)
-
-
 class V2XVehicleTracker:
     """Tracks the latest two samples per ``vehicle_id`` and exposes
     constant-velocity predictions over a caller-provided time grid."""
@@ -233,23 +217,14 @@ class V2XVehicleTracker:
         self._velocities: Dict[str, Tuple[float, float]] = {}
         self._velocity_valid: Dict[str, bool] = {}
         self._active: List[str] = []
-        # Local reception time (not the payload's own stamp) of the most
-        # recent sample per vehicle_id. Used to detect a stalled V2X feed:
-        # if the topic stops publishing entirely, update() stops being
-        # called, so this can only be judged against a caller-supplied
-        # "now" from a still-running periodic control loop.
-        self._last_seen: Dict[str, float] = {}
 
-    def update(self, msg, now: float = None) -> None:
-        if now is None:
-            now = time.monotonic()
+    def update(self, msg) -> None:
         active: List[str] = []
         for v in msg.vehicles:
             vid = v.vehicle_id
             t = _stamp_to_seconds(v.header.stamp)
             x = float(v.position.x)
             y = float(v.position.y)
-            self._last_seen[vid] = float(now)
             buf = self._samples.setdefault(vid, deque(maxlen=2))
 
             # Detect a position jump against the previous sample (if any).
@@ -312,64 +287,6 @@ class V2XVehicleTracker:
     def predict_all(self, t_samples) -> Dict[str, List[Tuple[float, float]]]:
         return {vid: self.predict_positions(vid, t_samples) for vid in self._active}
 
-    def last_seen(self, vehicle_id: str):
-        """Return the local reception time of the vehicle's latest sample,
-        or ``None`` if it has never been received."""
-        return self._last_seen.get(vehicle_id)
-
-    def is_fresh(
-        self, vehicle_id: str, now: float, sample_freshness_sec: float
-    ) -> bool:
-        return is_sample_fresh(
-            self._last_seen.get(vehicle_id), now, sample_freshness_sec)
-
-    def is_active_and_fresh(
-        self, vehicle_id: str, now: float, sample_freshness_sec: float
-    ) -> bool:
-        """Return whether ``vehicle_id`` was in the latest message *and*
-        has not exceeded ``sample_freshness_sec`` since its last sample.
-
-        Being "active" alone is not enough: a stalled V2X feed leaves
-        ``_active`` frozen at whatever the last message contained, since
-        :meth:`update` simply never runs again to refresh it. Callers that
-        gate per-vehicle logic (e.g. overtake target selection) on liveness
-        should use this instead of :meth:`active_vehicle_ids` alone.
-        """
-        return (
-            vehicle_id in self._active
-            and self.is_fresh(vehicle_id, now, sample_freshness_sec)
-        )
-
-    def purge_stale(self, now: float, sample_freshness_sec: float) -> List[str]:
-        """Drop vehicles whose last received sample is older than
-        ``sample_freshness_sec``.
-
-        This is the counterpart to a stalled V2X topic: if messages stop
-        arriving entirely, :meth:`update` is never called again and
-        ``_active``/``_samples`` would otherwise keep reporting the last
-        known (and increasingly wrong) positions forever. Callers must
-        invoke this periodically from their own clock-driven loop — it
-        cannot be discovered from inside :meth:`update` alone.
-
-        Returns the vehicle_ids that were purged, so callers can log a
-        communication-dropout warning and rebuild any obstacle lists that
-        were derived from the tracker.
-        """
-        stale_ids = [
-            vid for vid in self._active
-            if not is_sample_fresh(
-                self._last_seen.get(vid), now, sample_freshness_sec)
-        ]
-        for vid in stale_ids:
-            self._samples.pop(vid, None)
-            self._velocities.pop(vid, None)
-            self._velocity_valid.pop(vid, None)
-            self._last_seen.pop(vid, None)
-        if stale_ids:
-            stale_set = set(stale_ids)
-            self._active = [vid for vid in self._active if vid not in stale_set]
-        return stale_ids
-
 
 def predictions_to_obstacles(predictions, vehicle_radius: float, obstacle_cls=None):
     """Flatten a ``{vehicle_id: [(x, y), ...]}`` mapping into a list of
@@ -418,15 +335,6 @@ def should_reset_overtake_latch_for_target_change(
     Passing-side latches are deliberately sticky during one manoeuvre.  A
     different nearby/stopped vehicle is a new manoeuvre, however, and must not
     inherit the previous target's L0/L2 decision.
-
-    When two opponents are near-equidistant (e.g. running side by side), the
-    plain "any different relevant lead wins" rule made the target flip back
-    and forth every cycle, tearing the lane-change/hard-lane-probe state
-    machine down and rebuilding it many times per second. To damp that, a
-    candidate only replaces the active target if it is closer by at least
-    ``switch_margin_m``. If either distance is unavailable/non-finite the
-    hysteresis cannot be evaluated, so the switch is allowed (this also keeps
-    behaviour unchanged when the active target has been lost).
     """
     if not bool(
         candidate_is_relevant
@@ -443,7 +351,7 @@ def should_reset_overtake_latch_for_target_change(
     ):
         return True
     return float(candidate_target_distance) <= (
-        float(active_target_distance) - float(switch_margin_m)
+        float(active_target_distance) - max(float(switch_margin_m), 0.0)
     )
 
 

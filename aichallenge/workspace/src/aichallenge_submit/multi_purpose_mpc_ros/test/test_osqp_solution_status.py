@@ -3,19 +3,15 @@ from types import SimpleNamespace
 
 import numpy as np
 import osqp
-from scipy import sparse
 
 from multi_purpose_mpc_ros.core.MPC import (
     apply_outer_boundary_guard,
     can_reuse_prediction_fallback,
-    diagnose_mpc_prediction,
-    format_prediction_diagnostic,
     is_plausible_mpc_prediction,
     is_plausible_world_prediction,
     is_primal_infeasible,
     is_valid_osqp_solution,
     zero_inverted_bounds,
-    MPC,
 )
 
 
@@ -55,34 +51,6 @@ class TestOsqpSolutionStatus(unittest.TestCase):
         self.assertFalse(is_valid_osqp_solution(max_iter))
 
 
-class TestMpcDiagnosticInitialization(unittest.TestCase):
-    def test_constructor_initializes_timing_counters_and_caches(self):
-        model = SimpleNamespace(
-            n_states=3, length=1.0, Ts=0.025, safety_margin=0.1)
-        q = sparse.eye(3, format="csc")
-        r = sparse.eye(2, format="csc")
-        constraints = {
-            "xmin": np.array([-3.0, -3.0, -3.0]),
-            "xmax": np.array([3.0, 3.0, 3.0]),
-        }
-        inputs = {
-            "umin": np.array([0.0, -0.2]),
-            "umax": np.array([10.0, 0.2]),
-        }
-
-        mpc = MPC(
-            model, 5, q, r, q, constraints, inputs,
-            10.0, 0.6, 0, True, False)
-
-        for name in (
-            "startup", "linearize", "path_constraints", "sparse",
-            "constraints2", "vector", "update", "debug_counter",
-        ):
-            self.assertEqual(getattr(mpc, name), 0)
-        self.assertEqual(mpc._cached_umin_horizon.shape, (10,))
-        self.assertEqual(mpc.last_solve_attempts, [])
-
-
 class TestPredictionPlausibility(unittest.TestCase):
     def setUp(self):
         self.states = np.zeros((5, 3))
@@ -119,19 +87,6 @@ class TestPredictionPlausibility(unittest.TestCase):
             lateral_tolerance=0.02,
         ))
 
-    def test_diagnostic_reports_lateral_violation_details(self):
-        states = self.states.copy()
-        states[2, 0] = 2.03
-        diagnostic = diagnose_mpc_prediction(
-            states, self.prediction, (0.0, 0.0), self.lower, self.upper,
-            lateral_tolerance=0.02)
-
-        self.assertEqual(diagnostic["reason"], "lateral_above_upper")
-        self.assertEqual(diagnostic["point_index"], 2)
-        self.assertAlmostEqual(diagnostic["violation"], 0.03)
-        self.assertIn("violation=0.0300", format_prediction_diagnostic(
-            diagnostic))
-
     def test_distant_prediction_start_is_invalid(self):
         prediction = ([20.0, 21.0, 22.0], [0.0, 0.0, 0.0])
 
@@ -162,7 +117,6 @@ class TestOuterBoundaryGuard(unittest.TestCase):
     def test_full_width_insets_both_physical_edges(self):
         lower, upper = apply_outer_boundary_guard(
             self.lower, self.upper, None, 0.1)
-
         np.testing.assert_allclose(lower, [-2.9, -3.0])
         np.testing.assert_allclose(upper, [2.9, 3.0])
 
@@ -171,7 +125,6 @@ class TestOuterBoundaryGuard(unittest.TestCase):
             self.lower, self.upper, 0, 0.1)
         l2_lower, l2_upper = apply_outer_boundary_guard(
             self.lower, self.upper, 2, 0.1)
-
         np.testing.assert_allclose(l0_lower, self.lower + 0.1)
         np.testing.assert_allclose(l0_upper, self.upper)
         np.testing.assert_allclose(l2_lower, self.lower)
@@ -182,31 +135,18 @@ class TestOuterBoundaryGuard(unittest.TestCase):
         upper_before = self.upper.copy()
         lower, upper = apply_outer_boundary_guard(
             self.lower, self.upper, 1, 0.1)
-
         np.testing.assert_allclose(lower, lower_before)
         np.testing.assert_allclose(upper, upper_before)
         np.testing.assert_array_equal(self.lower, lower_before)
         np.testing.assert_array_equal(self.upper, upper_before)
 
-    def test_guard_can_expose_an_inverted_narrow_corridor(self):
+    def test_inverted_narrow_corridor_becomes_zero_width(self):
         lower, upper = apply_outer_boundary_guard(
             np.array([-0.04]), np.array([0.04]), None, 0.1)
-
         self.assertGreater(lower[0], upper[0])
-
-        normalized_lower, normalized_upper = zero_inverted_bounds(
-            lower, upper)
-        np.testing.assert_array_equal(normalized_lower, [0.0])
-        np.testing.assert_array_equal(normalized_upper, [0.0])
-
-    def test_normalization_preserves_valid_samples(self):
-        lower, upper = zero_inverted_bounds(
-            np.array([-1.0, 0.5]),
-            np.array([1.0, 0.4]),
-        )
-
-        np.testing.assert_array_equal(lower, [-1.0, 0.0])
-        np.testing.assert_array_equal(upper, [1.0, 0.0])
+        lower, upper = zero_inverted_bounds(lower, upper)
+        np.testing.assert_array_equal(lower, [0.0])
+        np.testing.assert_array_equal(upper, [0.0])
 
 
 class TestPredictionFallbackLimit(unittest.TestCase):

@@ -567,6 +567,17 @@ class ReferencePath:
                         wp.ub = float(ub_interp[idx])
                         wp.lb = float(lb_interp[idx])
                     #print(f"[ReferencePath] Interpolated offline waypoint_bounds.csv from {len(ub_vals)} to {len(self.waypoints)} waypoints.")
+
+                # Lane selection reads these cells directly.  Keep them in
+                # sync with the CSV bounds so the configured outer margin is
+                # actually present in hard L0/L2 constraints.
+                for wp in self.waypoints:
+                    normal_angle = wp.psi + math.pi / 2.0
+                    nx, ny = math.cos(normal_angle), math.sin(normal_angle)
+                    wp.static_border_cells = (
+                        (wp.x + wp.ub * nx, wp.y + wp.ub * ny),
+                        (wp.x + wp.lb * nx, wp.y + wp.lb * ny),
+                    )
             except Exception as e:
                 print(f"[ReferencePath] Error loading offline waypoint_bounds.csv: {e}")
 
@@ -773,6 +784,13 @@ class ReferencePath:
         ub_arr = self.bounds[:,1]
         lb_arr = self.bounds[:,2]
 
+        # Preserve the measured physical walls before applying margin and
+        # minimum-width recovery, so recovery never expands past a real wall.
+        ub_arr = np.clip(ub_arr, 0.3, 8.0)
+        lb_arr = np.clip(lb_arr, -8.0, -0.3)
+        raw_ub_arr = ub_arr.copy()
+        raw_lb_arr = lb_arr.copy()
+
         #if len(left_pts) == 0 or len(right_pts) == 0:
         #    print("[ReferencePath] Warning: update_boundaries_from_markers got empty arrays.", flush=True)
         #    return
@@ -874,9 +892,10 @@ class ReferencePath:
         ub_arr[narrow_mask] = center[narrow_mask] + (MIN_ROAD_WIDTH / 2.0)
         lb_arr[narrow_mask] = center[narrow_mask] - (MIN_ROAD_WIDTH / 2.0)
 
-        # クリッピング (現実的な幅の保証)
-        ub_arr = np.clip(ub_arr, 0.3, 8.0)
-        lb_arr = np.clip(lb_arr, -8.0, -0.3)
+        # Minimum-width recovery must not cancel the outside margin by
+        # expanding beyond the measured physical walls.
+        ub_arr = np.minimum(ub_arr, raw_ub_arr)
+        lb_arr = np.maximum(lb_arr, raw_lb_arr)
 
         # 平滑化（ガタつきをさらに抑制するために移動平均をかける）
         #_window = 10
@@ -890,6 +909,17 @@ class ReferencePath:
             if len(self.waypoints) == len(ub_arr) + 1:
                 self.waypoints[-1].ub = ub_arr[0]
                 self.waypoints[-1].lb = lb_arr[0]
+
+        # Hard outer-lane selection uses static_border_cells directly.
+        for wp in self.waypoints:
+            normal_angle = wp.psi + math.pi / 2.0
+            nx, ny = math.cos(normal_angle), math.sin(normal_angle)
+            wp.static_border_cells = (
+                (wp.x + wp.ub * nx, wp.y + wp.ub * ny),
+                (wp.x + wp.lb * nx, wp.y + wp.lb * ny),
+            )
+
+        self.reset_dynamic_constraints()
 
     def get_lane_bounds(self, wp_id: int, n_lanes: int = None, max_half_width: float = 3.8, lane_width: float = 1.7, inner_lane_width: float = None) -> list:
         """
@@ -1160,14 +1190,8 @@ class ReferencePath:
                 ub_o = (x, y)
                 lb_o = (x, y)
 
-        # もし min_width を満たすセグメントが1つも無い場合は、
-        # 見つかった全てのセグメントの中で最も幅が広いものをフォールバックとして採用する。
-        # ただし、そのセグメントの幅が min_width (車両幅ベースの閾値) にも満たない
-        # 場合は採用しない。採用すると、呼び出し元 (update_path_constraints) が
-        # 「有効なフリーセグメントが見つかった」と誤認し、車両幅より狭いコリドーを
-        # そのまま境界として確定してしまい、MPC が primal_infeasible になる。
-        # min_width 未満の場合は空リストのまま返し、呼び出し元の
-        # 「フリーセグメントなし」処理 (フルコース幅へのフォールバック) に委ねる。
+        # Do not promote a segment narrower than the vehicle-width threshold;
+        # let the caller use its full-width static fallback instead.
         if not free_segments and all_segments:
             all_segments.sort(key=lambda s: s[1], reverse=True)
             widest_segment, widest_width_sq = all_segments[0]
@@ -1496,15 +1520,8 @@ class ReferencePath:
                 #if not self.is_overtaking:
                     #print(f"No feasible free segment found! wp_id: {wp_id}, n: {n}. Forcing minimum width.", flush=True)
 
-                # フリーセグメントが車両幅を満たさず見つからない場合は、車線幅を
-                # 強制的に狭めるのではなく、静的ウェイポイント境界 (wp.static_border_cells)
-                # にフォールバックし、フルコース幅で探索できるようにする。
-                # かつて通常走行中 (is_overtaking == False) には centerline から左右
-                # FORCE_HALF_WIDTH(0.8m) の極小コリドー (計1.6m) を強制していたが、
-                # これは車両幅 (model_width) + safety_margin より狭くなり得るため、
-                # MPC 側の車両幅制約と矛盾して常に primal_infeasible になり得た。
-                # 全幅復帰モード (MPCSafetyRecovery) はここで is_overtaking=False と
-                # なるため、この狭幅フォールバックが復帰の妨げになっていた。
+                # A forced 1.6 m corridor can be narrower than the vehicle.
+                # Fall back to the full static corridor in every mode.
                 ub_ls = wp.static_border_cells[0]
                 lb_ls = wp.static_border_cells[1]
 

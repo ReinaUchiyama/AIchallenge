@@ -3,7 +3,6 @@ import decimal
 import decimal
 from numpy import typing
 from typing import Tuple
-import math
 import numpy as np
 import osqp
 from scipy import sparse
@@ -45,132 +44,6 @@ def curvature_lateral_shift(
     return float(np.clip(requested_shift, 0.0, max(float(max_shift), 0.0)))
 
 
-def steering_preview_index(
-    distances,
-    steering_refs,
-    start_index,
-    speed,
-    delay_sec,
-    steering_rate,
-    max_preview_distance,
-) -> int:
-    """Select a future steering reference early enough for the actuator.
-
-    The selection accounts for both command delay and the time needed to slew
-    from the reference at ``start_index`` to each future candidate.
-    """
-    distance_array = np.asarray(distances, dtype=float)
-    steering_array = np.asarray(steering_refs, dtype=float)
-    if distance_array.size == 0 or distance_array.size != steering_array.size:
-        return int(start_index)
-    start = int(np.clip(start_index, 0, distance_array.size - 1))
-    if speed <= 0.0 or steering_rate <= 0.0:
-        return start
-    preview_limit = max(float(max_preview_distance), 0.0)
-    selected = start
-    for candidate in range(start + 1, distance_array.size):
-        candidate_distance = distance_array[candidate] - distance_array[start]
-        if candidate_distance > preview_limit:
-            break
-        angle_change = abs(
-            steering_array[candidate] - steering_array[start])
-        required_start_distance = max(float(speed), 0.0) * (
-            max(float(delay_sec), 0.0) + angle_change / steering_rate)
-        # This future target has reached the point at which steering must
-        # already start. Select the furthest such target within the bounded
-        # preview so a sharp change just beyond the pure-delay point is not
-        # missed while traversing a straight segment.
-        if candidate_distance <= required_start_distance:
-            selected = candidate
-    return selected
-
-
-def steering_reachability_speed_cap(
-    distance,
-    angle_change,
-    delay_sec,
-    steering_rate,
-    minimum_angle_change=0.03,
-) -> float:
-    """Return speed that leaves enough time for delay plus steering slew."""
-    if (
-        distance <= 0.0
-        or steering_rate <= 0.0
-        or abs(angle_change) <= max(float(minimum_angle_change), 0.0)
-    ):
-        return math.inf
-    required_time = (
-        max(float(delay_sec), 0.0)
-        + abs(float(angle_change)) / float(steering_rate)
-    )
-    return float(distance) / max(required_time, 1e-6)
-
-
-def build_arc_length_steering_reservation(
-    distances,
-    steering_refs,
-    speeds,
-    delay_sec,
-    steering_rate,
-    current_steering,
-    command_period,
-):
-    """Build a delayed, rate-feasible steering schedule along arc length."""
-    distance_array = np.asarray(distances, dtype=float)
-    reference_array = np.asarray(steering_refs, dtype=float)
-    speed_array = np.asarray(speeds, dtype=float)
-    if (
-        distance_array.size == 0
-        or distance_array.size != reference_array.size
-        or distance_array.size != speed_array.size
-        or steering_rate <= 0.0
-    ):
-        return reference_array.copy()
-
-    count = distance_array.size
-    delayed = reference_array.copy()
-    for index in range(count):
-        target_distance = (
-            distance_array[index]
-            + max(float(speed_array[index]), 0.0)
-            * max(float(delay_sec), 0.0)
-        )
-        target_index = int(np.searchsorted(
-            distance_array, target_distance, side='left'))
-        target_index = min(max(target_index, index), count - 1)
-        delayed[index] = reference_array[target_index]
-
-    # Backward propagation reserves the latest feasible start of each future
-    # steering change instead of waiting for lateral error at the corner.
-    reserved = delayed.copy()
-    for index in range(count - 2, -1, -1):
-        ds = max(float(distance_array[index + 1] - distance_array[index]), 0.0)
-        speed = max(float(speed_array[index]), 0.5)
-        max_change = float(steering_rate) * ds / speed
-        reserved[index] = float(np.clip(
-            reserved[index],
-            reserved[index + 1] - max_change,
-            reserved[index + 1] + max_change,
-        ))
-
-    # Anchor the first scheduled command to the command actually owned by the
-    # actuator, then keep the complete schedule rate-feasible going forward.
-    previous = float(current_steering)
-    for index in range(count):
-        if index == 0:
-            max_change = (
-                float(steering_rate) * max(float(command_period), 0.0))
-        else:
-            ds = max(float(
-                distance_array[index] - distance_array[index - 1]), 0.0)
-            speed = max(float(speed_array[index - 1]), 0.5)
-            max_change = float(steering_rate) * ds / speed
-        reserved[index] = float(np.clip(
-            reserved[index], previous - max_change, previous + max_change))
-        previous = reserved[index]
-    return reserved
-
-
 def is_valid_osqp_solution(result) -> bool:
     """Return whether OSQP produced a usable optimal solution."""
     return (
@@ -187,100 +60,6 @@ def is_primal_infeasible(result) -> bool:
         result is not None
         and result.info.status_val in OSQP_PRIMAL_INFEASIBLE_STATUSES
     )
-
-
-def diagnose_mpc_prediction(
-    spatial_states, world_prediction, current_position, lower_bounds,
-    upper_bounds, lateral_tolerance=0.5, max_start_distance=8.0,
-    max_step_distance=5.0,
-) -> dict:
-    """Return a structured reason when a finite OSQP result is unusable."""
-    diagnostic = {
-        "valid": False, "reason": "unknown", "point_index": None,
-        "lateral": np.nan, "lower": np.nan, "upper": np.nan,
-        "violation": np.nan, "start_distance": np.nan,
-        "max_step_distance": np.nan, "max_step_index": None,
-    }
-    states = np.asarray(spatial_states)
-    if states.ndim != 2 or states.shape[0] < 3 or states.shape[1] < 2:
-        diagnostic.update(reason="invalid_spatial_shape", shape=states.shape)
-        return diagnostic
-    if not np.all(np.isfinite(states)):
-        invalid = np.argwhere(~np.isfinite(states))[0]
-        diagnostic.update(
-            reason="non_finite_spatial_state",
-            point_index=int(invalid[0]), state_index=int(invalid[1]))
-        return diagnostic
-    lower = np.asarray(lower_bounds, dtype=float).reshape(-1)
-    upper = np.asarray(upper_bounds, dtype=float).reshape(-1)
-    n_bounds = min(states.shape[0] - 1, lower.size, upper.size)
-    if n_bounds == 0:
-        diagnostic["reason"] = "missing_bounds"
-        return diagnostic
-    lateral = states[1:n_bounds + 1, 0]
-    lower_violation = lower[:n_bounds] - lateral
-    upper_violation = lateral - upper[:n_bounds]
-    worst_lower = int(np.argmax(lower_violation))
-    worst_upper = int(np.argmax(upper_violation))
-    if lower_violation[worst_lower] > lateral_tolerance:
-        diagnostic.update(
-            reason="lateral_below_lower", point_index=worst_lower + 1,
-            lateral=float(lateral[worst_lower]),
-            lower=float(lower[worst_lower]), upper=float(upper[worst_lower]),
-            violation=float(lower_violation[worst_lower]))
-        return diagnostic
-    if upper_violation[worst_upper] > lateral_tolerance:
-        diagnostic.update(
-            reason="lateral_above_upper", point_index=worst_upper + 1,
-            lateral=float(lateral[worst_upper]),
-            lower=float(lower[worst_upper]), upper=float(upper[worst_upper]),
-            violation=float(upper_violation[worst_upper]))
-        return diagnostic
-    x_pred, y_pred = world_prediction
-    points = np.column_stack((x_pred, y_pred))
-    if points.shape[0] == 0:
-        diagnostic["reason"] = "empty_world_prediction"
-        return diagnostic
-    if not np.all(np.isfinite(points)):
-        diagnostic["reason"] = "non_finite_world_prediction"
-        return diagnostic
-    current_xy = np.asarray(current_position, dtype=float)
-    if current_xy.shape != (2,) or not np.all(np.isfinite(current_xy)):
-        diagnostic["reason"] = "invalid_current_position"
-        return diagnostic
-    start_distance = float(np.linalg.norm(points[0] - current_xy))
-    diagnostic["start_distance"] = start_distance
-    if start_distance > max_start_distance:
-        diagnostic.update(
-            reason="prediction_start_too_far",
-            violation=start_distance - max_start_distance)
-        return diagnostic
-    if len(points) > 1:
-        steps = np.linalg.norm(np.diff(points, axis=0), axis=1)
-        index = int(np.argmax(steps))
-        diagnostic.update(
-            max_step_distance=float(steps[index]), max_step_index=index)
-        if steps[index] > max_step_distance:
-            diagnostic.update(
-                reason="prediction_step_too_far", point_index=index + 1,
-                violation=float(steps[index] - max_step_distance))
-            return diagnostic
-    diagnostic.update(valid=True, reason="ok")
-    return diagnostic
-
-
-def format_prediction_diagnostic(diagnostic) -> str:
-    """Format prediction diagnostics as stable key/value log fields."""
-    fields = []
-    for key in (
-        "reason", "point_index", "lateral", "lower", "upper", "violation",
-        "start_distance", "max_step_distance", "max_step_index",
-    ):
-        value = diagnostic.get(key)
-        if isinstance(value, (float, np.floating)):
-            value = f"{float(value):.4f}" if np.isfinite(value) else "nan"
-        fields.append(f"{key}={value}")
-    return " ".join(fields)
 
 
 def is_plausible_mpc_prediction(
@@ -320,21 +99,9 @@ def is_plausible_mpc_prediction(
 
 
 def apply_outer_boundary_guard(
-    lower_bounds,
-    upper_bounds,
-    target_lane,
-    guard_margin,
+    lower_bounds, upper_bounds, target_lane, guard_margin,
 ):
-    """Inset only the physical course edge(s) used by the active corridor.
-
-    L0 touches the lower/right physical edge and L2 touches the upper/left
-    edge.  Full-width/Race driving touches both.  L1 is bounded only by
-    internal lane boundaries, so applying this wall guard there would narrow
-    an already constrained rejoin corridor without adding wall clearance.
-
-    Always copy the arrays: the non-obstacle path can hand us views into the
-    reference path's cached constraints, which must not be modified in place.
-    """
+    """Inset only the physical course edge(s) used by the active corridor."""
     lower = np.asarray(lower_bounds, dtype=float).copy()
     upper = np.asarray(upper_bounds, dtype=float).copy()
     guard = float(guard_margin)
@@ -428,16 +195,7 @@ class MPC:
     def __init__(self, model, N, Q, R, QN, StateConstraints, InputConstraints,
                  ay_max, max_steering_rate, wp_id_offset, use_obstacle_avoidance,
                  use_path_constraints_topic, use_max_kappa_pred=True,
-                 understeer_coeff=0.0, use_steering_state=False,
-                 steering_state_weight=1.0e6,
-                 terminal_steering_state_weight=1.0e6,
-                 steering_preview_enabled=True,
-                 steering_command_delay=0.15,
-                 steering_preview_max_distance=6.0,
-                 steering_reservation_enabled=False,
-                 steering_reachability_speed_enabled=True,
-                 steering_reachability_min_speed=2.0,
-                 steering_reachability_min_angle=0.03):
+                 understeer_coeff=0.0):
         """
         Constructor for the Model Predictive Controller.
         :param model: bicycle model object to be controlled
@@ -458,27 +216,15 @@ class MPC:
         # MPCの設定値と内部変数を初期化する
         # 既存の初期化パラメータ
         self.N = N #予測ホライズン
-        self.model = model #車両モデル
-        self.uses_steering_state = bool(use_steering_state)
-        self.model_nx = self.model.n_states
-        if self.uses_steering_state:
-            self.Q = sparse.block_diag([
-                Q, sparse.csc_matrix([[float(steering_state_weight)]])
-            ], format='csc')
-            self.QN = sparse.block_diag([
-                QN,
-                sparse.csc_matrix(
-                    [[float(terminal_steering_state_weight)]])
-            ], format='csc')
-        else:
-            self.Q = Q
-            self.QN = QN
+        self.Q = Q #状態誤差の重み
         self.R = R #入力コスト
         #R =[[1,0],[0,20]]なら速度変更は許す、操舵変更は嫌う
+        self.QN = QN
         self.wp_id_offset = wp_id_offset
         self.use_obstacle_avoidance = use_obstacle_avoidance
         self.use_path_constraints_topic = use_path_constraints_topic
-        self.nx = self.model_nx + (1 if self.uses_steering_state else 0)
+        self.model = model #車両モデル
+        self.nx = self.model.n_states
         self.nu = 2
         # This objective-only target is independent from target_lane_idx.
         # It lets recovery keep full-width bounds while gently attracting the
@@ -486,14 +232,6 @@ class MPC:
         self.soft_target_lane_idx = None
         self.soft_target_start_e_y = 0.0
         self.soft_target_alpha = 0.0
-        # Optional post-L1-release steering envelope.  While active, the
-        # excess steering relative to the path feed-forward angle must shrink
-        # toward the configured neutral band at every prediction step.  This
-        # prevents receding-horizon MPC from postponing corner-exit unwind.
-        self.steering_unwind_active = False
-        self.steering_unwind_initial_excess = 0.0
-        self.steering_unwind_rate = 0.0
-        self.steering_unwind_neutral_band = 0.0
 
         # setupが済んでいるかどうか
         self.osqp_initialized = False
@@ -502,10 +240,8 @@ class MPC:
         self.nx_N = self.nx * (self.N + 1)
         self.nu_N = self.nu * self.N
 
-        # With delta as a state, delta_rate is constrained directly by the
-        # ordinary input bounds. The legacy model instead constrains adjacent
-        # curvature inputs.
-        self.n_rate_constraints = 0 if self.uses_steering_state else N - 1
+        # ステアリングレート制約行列の作成
+        self.n_rate_constraints = N - 1
         steering_rate_matrix = sparse.lil_matrix(
             (self.n_rate_constraints, self.nx_N + self.nu_N)
         )
@@ -522,7 +258,7 @@ class MPC:
             self.basic_constraint_matrix,
             self.steering_rate_matrix
         ], format='csc')        
-        
+
 
         #Axのsparse.eye()固定
         self.Ax_base = sparse.kron(
@@ -536,9 +272,6 @@ class MPC:
             self.QN,
             sparse.kron(sparse.eye(self.N), self.R)
         ], format='csc')
-        # Fixed horizon vectors used by every QP build. Keep these alongside
-        # P_base/A_inequality so numpy does not recreate them at 40 Hz.
-        self._refresh_cost_vector_cache()
 
         # A, B行列のスパース構造を完全に固定するためのインデックス事前計算
         row_A, col_A = [], []
@@ -556,78 +289,14 @@ class MPC:
         self.row_B = np.array(row_B)
         self.col_B = np.array(col_B)
 
-        if self.uses_steering_state:
-            delta_limit = np.arctan(
-                float(InputConstraints['umax'][1]) * self.model.length)
-            self.state_constraints = {
-                'xmin': np.append(
-                    np.asarray(StateConstraints['xmin'], dtype=float),
-                    -delta_limit),
-                'xmax': np.append(
-                    np.asarray(StateConstraints['xmax'], dtype=float),
-                    delta_limit),
-            }
-            self.input_constraints = {
-                'umin': np.array([
-                    float(InputConstraints['umin'][0]),
-                    -float(max_steering_rate),
-                ]),
-                'umax': np.array([
-                    float(InputConstraints['umax'][0]),
-                    float(max_steering_rate),
-                ]),
-            }
-        else:
-            self.state_constraints = StateConstraints
-            self.input_constraints = InputConstraints
-        self._cached_umin_horizon = np.tile(
-            np.asarray(self.input_constraints['umin'], dtype=float), self.N)
-        self._cached_rate_lower = (
-            -float(max_steering_rate) * self.model.Ts
-            * np.ones(self.n_rate_constraints))
-        self._cached_rate_upper = -self._cached_rate_lower
+        self.state_constraints = StateConstraints
+        self.input_constraints = InputConstraints
         self.ay_max = ay_max
         self.understeer_coeff = max(float(understeer_coeff), 0.0)
-        self.steering_preview_enabled = bool(steering_preview_enabled)
-        self.steering_command_delay = max(float(steering_command_delay), 0.0)
-        self.steering_preview_max_distance = max(
-            float(steering_preview_max_distance), 0.0)
-        self.steering_reservation_enabled = bool(
-            steering_reservation_enabled)
-        self.steering_reachability_speed_enabled = bool(
-            steering_reachability_speed_enabled)
-        self.steering_reachability_min_speed = max(
-            float(steering_reachability_min_speed), 0.0)
-        self.steering_reachability_min_angle = max(
-            float(steering_reachability_min_angle), 0.0)
 
         # 追加: ステアリングレート制限関連のパラメータ
         self.max_steering_rate = max_steering_rate
         self.previous_steering = 0.0  # 前回のステア角
-        # Last QP attempt diagnostics.  These are deliberately independent
-        # from current_control/current_prediction, which may contain a reused
-        # fallback after a failed solve.
-        self.last_attempt_feasible = False
-        self.last_attempt_status = "not_solved"
-        self.last_attempt_initial_steering = 0.0
-        self.last_attempt_predicted_steering = np.array([], dtype=float)
-        self.last_attempt_steering_rate = np.array([], dtype=float)
-        self.last_attempt_command_steering = np.array([], dtype=float)
-        self.last_attempt_target_steering = np.array([], dtype=float)
-        self.last_attempt_steering_angle_margin = np.nan
-        self.last_attempt_steering_rate_margin = np.nan
-        self.last_solve_attempts = []
-        self.last_prediction_diagnostic = {
-            "valid": False, "reason": "not_evaluated"}
-        self.last_attempt_primal_infeasible = False
-        self.last_build_ms = 0.0
-        self.last_solve_ms = 0.0
-        self.last_total_ms = 0.0
-        self.last_attempt_primal_infeasible = False
-        self.primal_infeasible_event_count = 0
-        self.time_budget_exceeded_event_count = 0
-        self.steering_rate_limited = False
-        self.steering_rate_speed_cap = np.inf
 
         # 追加: ay_maxによる速度制限の方式切り替え
         self.use_max_kappa_pred = use_max_kappa_pred
@@ -636,17 +305,12 @@ class MPC:
         self.infeasibility_counter = 0
         self.solve_time_budget_ms = 20.0
         self.max_prediction_fallback_cycles = 3
-        # Keep predicted vehicle centers away from physical course edges and
-        # reject solver solutions outside the exact corridor beyond ordinary
-        # OSQP numerical error.  Both are configurable by the controller.
         self.prediction_outer_boundary_guard = 0.0
         self.prediction_lateral_tolerance = 0.02
         self.used_prediction_fallback = False
         self.time_budget_exceeded = False
         self.recovery_requested = False
         self.failure_reason = None
-        self.steering_rate_limited = False
-        self.steering_rate_speed_cap = np.inf
         self.soft_target_lane_idx = None
         self.soft_target_start_e_y = 0.0
         self.soft_target_alpha = 0.0
@@ -660,43 +324,22 @@ class MPC:
         self.last_solved_wp_id = 0
         self.current_control = np.zeros((self.nu*self.N))
         self.optimizer = osqp.OSQP()
+
         self.debug_counter = 0
-        self.startup = 0
-        self.linearize = 0
-        self.path_constraints = 0
-        self.sparse = 0
-        self.constraints2 = 0
-        self.vector = 0
-        self.update = 0
+
+        self.startup =0
+        self.linearize =0
+        self.path_constraints =0
+        self.sparse =0
+        self.constraints2 =0
+        self.vector =0
+        self.update =0
+
 
         if not self.use_obstacle_avoidance:
             self.model.reference_path.update_simple_path_constraints(
-                N, self.model.safety_margin)
-
-    def _refresh_cost_vector_cache(self):
-        """Refresh fixed cost-vector coefficients after weight changes."""
-        self._cached_q_state_diag = np.tile(
-            np.asarray(self.Q.diagonal(), dtype=float), self.N)
-        self._cached_q_input_diag = np.tile(
-            np.asarray(self.R.diagonal(), dtype=float), self.N)
-
-    def _record_osqp_attempt(
-        self, phase: str, result, wall_solve_ms: float, safety_margin: float
-    ) -> None:
-        """Record one OSQP call independently from later retry outcomes."""
-        info = getattr(result, "info", None)
-        self.last_solve_attempts.append({
-            "phase": str(phase),
-            "status": str(getattr(info, "status", "missing_result")),
-            "status_val": int(getattr(info, "status_val", -1)),
-            "iterations": int(getattr(info, "iter", 0)),
-            "wall_solve_ms": float(wall_solve_ms),
-            "osqp_run_ms": 1000.0 * float(getattr(info, "run_time", 0.0)),
-            "osqp_solve_ms": 1000.0 * float(
-                getattr(info, "solve_time", 0.0)),
-            "safety_margin": float(safety_margin),
-            "primal_infeasible": bool(is_primal_infeasible(result)),
-        })
+                N,
+                self.model.safety_margin)
 
     def update_v_max(self, v_max: float):
         self.input_constraints['umax'][0] = v_max
@@ -710,38 +353,14 @@ class MPC:
     def update_wp_id_offset(self, wp_id_offset: int):
         self.wp_id_offset = wp_id_offset
 
-    def configure_steering_unwind(
-            self, active: bool, initial_excess: float = 0.0,
-            unwind_rate: float = 0.0, neutral_band: float = 0.0):
-        """Configure the temporary post-lane-release steering envelope."""
-        self.steering_unwind_active = bool(active and self.uses_steering_state)
-        self.steering_unwind_initial_excess = float(initial_excess)
-        self.steering_unwind_rate = max(float(unwind_rate), 0.0)
-        self.steering_unwind_neutral_band = max(float(neutral_band), 0.0)
-
     def update_Q(self, Q: np.ndarray):
-        if self.uses_steering_state and Q.shape == (self.model_nx, self.model_nx):
-            steering_weight = float(self.Q[-1, -1])
-            self.Q = sparse.block_diag([
-                Q, sparse.csc_matrix([[steering_weight]])
-            ], format='csc')
-        else:
-            self.Q = Q
-        self._refresh_cost_vector_cache()
+        self.Q = Q
 
     def update_R(self, R: np.ndarray):
         self.R = R
-        self._refresh_cost_vector_cache()
 
     def update_QN(self, QN: np.ndarray):
-        if self.uses_steering_state and QN.shape == (self.model_nx, self.model_nx):
-            steering_weight = float(self.QN[-1, -1])
-            self.QN = sparse.block_diag([
-                QN, sparse.csc_matrix([[steering_weight]])
-            ], format='csc')
-        else:
-            self.QN = QN
-        self._refresh_cost_vector_cache()
+        self.QN = QN
 
     def set_soft_lateral_reference(
         self, lane_idx=None, start_e_y=0.0, alpha=0.0,
@@ -799,103 +418,11 @@ class MPC:
         xmax_dyn = np.kron(np.ones(N + 1), xmax)
         umax_dyn = np.kron(np.ones(N), umax)
 
-        # Get curvature predictions.  In the legacy formulation the second
-        # input is curvature.  In the steering-state formulation it is a
-        # steering *rate*, so interpreting current_control[1::2] as a steering
-        # angle produces a completely fictitious lateral-acceleration limit.
-        kappa_pred = None
-        if not self.uses_steering_state:
-            kappa_pred = np.tan(np.append(
-                np.array(self.current_control[3::self.nu]),
-                self.current_control[-1])) / self.model.length
+        # Get curvature predictions
+        kappa_pred = np.tan(np.append(np.array(self.current_control[3::self.nu]), self.current_control[-1])) / self.model.length
 
         # Consider control delay
         self.model.wp_id += self.wp_id_offset
-
-        # Build the path-required steering sequence once.  The vehicle model
-        # remains linearised at the local path curvature, while the steering
-        # state objective is advanced by actuator delay plus slew time.  This
-        # makes steering start before lateral/heading error has already grown.
-        steering_reference = np.zeros(N + 1, dtype=float)
-        horizon_distance = np.zeros(N + 1, dtype=float)
-        if self.uses_steering_state:
-            delta_limit = float(self.state_constraints['xmax'][3])
-            for index in range(N + 1):
-                waypoint = self.model.reference_path.get_waypoint(
-                    self.model.wp_id + index)
-                gain = understeer_curvature_gain(
-                    waypoint.v_ref, self.understeer_coeff)
-                kappa_cmd = waypoint.kappa / max(gain, 1e-3)
-                steering_reference[index] = float(np.clip(
-                    math.atan(self.model.length * kappa_cmd),
-                    -delta_limit,
-                    delta_limit,
-                ))
-                if index:
-                    previous_waypoint = self.model.reference_path.get_waypoint(
-                        self.model.wp_id + index - 1)
-                    horizon_distance[index] = (
-                        horizon_distance[index - 1]
-                        + float(waypoint - previous_waypoint)
-                    )
-
-            preview_reference = steering_reference.copy()
-            if self.steering_reservation_enabled:
-                reservation_speeds = np.asarray([
-                    max(float(self.model.reference_path.get_waypoint(
-                        self.model.wp_id + index).v_ref), 0.0)
-                    for index in range(N + 1)
-                ], dtype=float)
-                preview_reference = build_arc_length_steering_reservation(
-                    horizon_distance,
-                    steering_reference,
-                    reservation_speeds,
-                    self.steering_command_delay,
-                    self.max_steering_rate,
-                    self.previous_steering,
-                    self.model.Ts,
-                )
-            elif self.steering_preview_enabled:
-                for index in range(N + 1):
-                    waypoint = self.model.reference_path.get_waypoint(
-                        self.model.wp_id + index)
-                    preview_index = steering_preview_index(
-                        horizon_distance,
-                        steering_reference,
-                        index,
-                        max(float(waypoint.v_ref), 0.0),
-                        self.steering_command_delay,
-                        self.max_steering_rate,
-                        self.steering_preview_max_distance,
-                    )
-                    preview_reference[index] = steering_reference[preview_index]
-
-            # If even full-rate steering cannot reach an upcoming reference,
-            # constrain only the controls before that point.  A floor prevents
-            # an abrupt curve at the current waypoint from immobilising cars.
-            if self.steering_reachability_speed_enabled:
-                # This optional cap is for an upcoming change in path demand,
-                # not for correcting the current tracking error.  Using the
-                # measured/current delta here made every nearby waypoint apply
-                # the minimum-speed floor whenever the actuator lagged by only
-                # a few hundredths of a radian.
-                initial_delta = float(steering_reference[0])
-                for target_index in range(1, N + 1):
-                    speed_cap = steering_reachability_speed_cap(
-                        horizon_distance[target_index],
-                        steering_reference[target_index] - initial_delta,
-                        self.steering_command_delay,
-                        self.max_steering_rate,
-                        self.steering_reachability_min_angle,
-                    )
-                    if not np.isfinite(speed_cap):
-                        continue
-                    speed_cap = max(
-                        speed_cap, self.steering_reachability_min_speed)
-                    for control_index in range(min(target_index, N)):
-                        velocity_index = control_index * self.nu
-                        umax_dyn[velocity_index] = min(
-                            umax_dyn[velocity_index], speed_cap)
 
         # Iterate over horizon
         t_pref = time.perf_counter()
@@ -911,83 +438,9 @@ class MPC:
             v_ref = np.clip(current_waypoint.v_ref, self.input_constraints['umin'][0], self.input_constraints['umax'][0])
             #v_ref = 12.5 
 
-            # Compute the original [e_y, e_psi, t] model first.
-            f_model, A_model, B_model = self.model.linearize(
+            # Compute LTV matrices
+            f, A_lin, B_lin = self.model.linearize(
                 v_ref, kappa_ref, delta_s, self.understeer_coeff)
-
-            curvature_gain = understeer_curvature_gain(
-                v_ref, self.understeer_coeff)
-            kappa_cmd_ref = kappa_ref / max(curvature_gain, 1e-3)
-
-            if self.uses_steering_state:
-                # State: [e_y, e_psi, t, delta]
-                # Input: [v, delta_rate]
-                delta_limit = float(self.state_constraints['xmax'][3])
-                # Use the advanced value only as a steering objective.  The
-                # lateral dynamics below are still linearised about the local
-                # path curvature, avoiding fictitious early road curvature.
-                delta_ref = float(steering_reference[n])
-                objective_delta_ref = float(preview_reference[n])
-                next_delta_ref = float(preview_reference[n + 1])
-                dkappa_ddelta = (
-                    1.0
-                    / (self.model.length * np.cos(delta_ref) ** 2)
-                )
-                dt_ref = float(delta_s) / max(float(v_ref), 0.5)
-                delta_change_ref = next_delta_ref - objective_delta_ref
-                delta_rate_ref = float(np.clip(
-                    delta_change_ref / max(dt_ref, 1e-3),
-                    -self.max_steering_rate,
-                    self.max_steering_rate))
-
-                # The rest of this model is spatially discretised: one state
-                # transition spans delta_s metres, not one controller tick.
-                # Therefore steering is the same continuous delta_rate law
-                # integrated over the predicted travel time delta_s / v.
-                # Linearise that duration around (v_ref, delta_rate_ref).
-                steering_step_ref = delta_rate_ref * float(delta_s) / max(
-                    float(v_ref), 0.5)
-                dstep_dv = (
-                    -delta_rate_ref * float(delta_s)
-                    / max(float(v_ref), 0.5) ** 2
-                )
-                dstep_drate = dt_ref
-
-                A_lin = np.zeros((self.nx, self.nx), dtype=float)
-                B_lin = np.zeros((self.nx, self.nu), dtype=float)
-                A_lin[:self.model_nx, :self.model_nx] = A_model
-                A_lin[:self.model_nx, 3] = (
-                    B_model[:, 1] * dkappa_ddelta)
-                A_lin[3, 3] = 1.0
-                B_lin[:self.model_nx, 0] = B_model[:, 0]
-                B_lin[3, 0] = dstep_dv
-                B_lin[3, 1] = dstep_drate
-
-                # Preserve the affine operating point of the original
-                # curvature-input model after substituting the linearised
-                # kappa(delta) relation.
-                uq_model = (
-                    B_model[:, 0] * v_ref
-                    - f_model
-                    + B_model[:, 1] * dkappa_ddelta * delta_ref
-                )
-                uq_delta = (
-                    -steering_step_ref
-                    + dstep_dv * v_ref
-                    + dstep_drate * delta_rate_ref
-                )
-                uq[n * self.nx:(n + 1) * self.nx] = np.append(
-                    uq_model, uq_delta)
-                ur[n * self.nu:(n + 1) * self.nu] = [
-                    v_ref, delta_rate_ref]
-                xr[n * self.nx + 3] = objective_delta_ref
-            else:
-                A_lin = A_model
-                B_lin = B_model
-                ur[n*self.nu:(n+1)*self.nu] = [v_ref, kappa_cmd_ref]
-                uq[n * self.nx:(n+1)*self.nx] = B_lin.dot(
-                    [v_ref, kappa_cmd_ref]) - f_model
-
             eps = 1e-9
             A_lin[np.abs(A_lin) < eps] = eps
             B_lin[np.abs(B_lin) < eps] = eps
@@ -996,6 +449,16 @@ class MPC:
             A_data[n*self.nx*self.nx : (n+1)*self.nx*self.nx] = A_lin.flatten()
             B_data[n*self.nx*self.nu : (n+1)*self.nx*self.nu] = B_lin.flatten()
 
+            # Set reference
+            curvature_gain = understeer_curvature_gain(
+                v_ref, self.understeer_coeff)
+            # Request enough commanded curvature for the speed-dependent
+            # model to achieve the reference-path curvature.
+            kappa_cmd_ref = kappa_ref / max(curvature_gain, 1e-3)
+            ur[n*self.nu:(n+1)*self.nu] = [v_ref, kappa_cmd_ref]
+            uq[n * self.nx:(n+1)*self.nx] = B_lin.dot(
+                [v_ref, kappa_cmd_ref]) - f
+
             # Set spatial reference e_y to target lane center with vehicle safety offset
             target_lane = getattr(self.model.reference_path, 'target_lane_idx', None)
             if target_lane is not None:
@@ -1003,51 +466,16 @@ class MPC:
 
             # Constrain maximum speed based on curvature
             # 曲率にもとづいた最大速度の制約
-            if self.uses_steering_state:
-                # Use path curvature, not the second MPC input (delta_rate),
-                # for the lateral-acceleration speed limit.
-                if self.use_max_kappa_pred:
-                    horizon_kappa = [
-                        abs(self.model.reference_path.get_waypoint(
-                            self.model.wp_id + j).kappa)
-                        for j in range(n, N)
-                    ]
-                    max_kappa_pred = max(horizon_kappa, default=0.0)
-                else:
-                    max_kappa_pred = abs(kappa_ref)
-                vmax_dyn = np.sqrt(
-                    self.ay_max / (max_kappa_pred + 1e-12))
-                debug_kappa_pred = max_kappa_pred
-
-                # Slow down when the distance interval would otherwise pass
-                # before the actuator can complete the reference change.
-                # With preview enabled, adjacent objective values can skip
-                # several waypoints. Treating that objective jump as road
-                # curvature change imposes an artificial near-crawl speed.
-                # Preview reachability has its own optional prefix cap, while
-                # the committed first command retains the existing measured
-                # steering-rate saturation speed protection.
-                if (
-                    not self.steering_preview_enabled
-                    and abs(delta_change_ref) > 1e-4
-                ):
-                    steering_vmax = (
-                        self.max_steering_rate * float(delta_s)
-                        / abs(delta_change_ref)
-                    )
-                    vmax_dyn = min(vmax_dyn, steering_vmax)
-            elif self.use_max_kappa_pred:
+            if self.use_max_kappa_pred:
                 max_kappa_pred = np.max(np.abs(kappa_pred[n:]))
                 vmax_dyn = np.sqrt(self.ay_max / (np.abs(max_kappa_pred) + 1e-12))
-                debug_kappa_pred = max_kappa_pred
             else:
                 vmax_dyn = np.sqrt(self.ay_max / (np.abs(kappa_pred[n]) + 1e-12))
-                debug_kappa_pred = kappa_pred[n]
                 
             umax_dyn[self.nu*n] = min(vmax_dyn, umax_dyn[self.nu*n])
 
             if n == 0:
-                self.deibug_max_kappa_pred = debug_kappa_pred
+                self.deibug_max_kappa_pred = max_kappa_pred if self.use_max_kappa_pred else kappa_pred[n]
                 self.debug_vmax_dyn = vmax_dyn
 
             #if n == 0 and self.debug_counter % 20 == 0:
@@ -1061,45 +489,6 @@ class MPC:
         target_lane = getattr(self.model.reference_path, 'target_lane_idx', None)
         if target_lane is not None:
             xr[N * self.nx] = self._compute_lane_center(self.model.wp_id + N, target_lane)
-        if self.uses_steering_state:
-            xr[N * self.nx + 3] = preview_reference[N]
-
-            if self.steering_unwind_active:
-                # State zero is fixed to the measured/last-issued steering
-                # angle.  Constrain states 1..N relative to each point's own
-                # path-required angle.  Only the release-side bound is
-                # tightened, so a changing road curvature may still request
-                # steering in the opposite direction when necessary.
-                release_sign = math.copysign(
-                    1.0, self.steering_unwind_initial_excess)
-                initial_magnitude = abs(self.steering_unwind_initial_excess)
-                for index in range(1, N + 1):
-                    waypoint = self.model.reference_path.get_waypoint(
-                        self.model.wp_id + index)
-                    gain = understeer_curvature_gain(
-                        waypoint.v_ref, self.understeer_coeff)
-                    kappa_cmd = waypoint.kappa / max(gain, 1e-3)
-                    delta_ref = float(np.clip(
-                        math.atan(self.model.length * kappa_cmd),
-                        self.state_constraints['xmin'][3],
-                        self.state_constraints['xmax'][3],
-                    ))
-                    allowed_excess = max(
-                        self.steering_unwind_neutral_band,
-                        initial_magnitude
-                        - self.steering_unwind_rate * index * self.model.Ts,
-                    )
-                    delta_state = index * self.nx + 3
-                    if release_sign > 0.0:
-                        xmax_dyn[delta_state] = min(
-                            xmax_dyn[delta_state],
-                            delta_ref + allowed_excess,
-                        )
-                    else:
-                        xmin_dyn[delta_state] = max(
-                            xmin_dyn[delta_state],
-                            delta_ref - allowed_excess,
-                        )
 
         t_linearize = time.perf_counter()
 
@@ -1145,11 +534,9 @@ class MPC:
             self._constraint_target_lane,
             self.prediction_outer_boundary_guard,
         )
-        # Obstacle narrowing may already leave a corridor thinner than the
-        # physical-edge guard.  Never send inverted bounds to OSQP: represent
-        # those invalid prediction points with the existing zero-width
-        # sentinel so the QP becomes safely infeasible instead of raising an
-        # uncaught bounds-update exception.
+        # A guard wider than an already narrowed corridor must never invert
+        # the bounds passed to OSQP.  The zero-width sentinel makes the
+        # problem safely infeasible and lets the existing recovery run.
         lb, ub = zero_inverted_bounds(lb, ub)
 
         # Update dynamic state constraints
@@ -1214,19 +601,17 @@ class MPC:
 
         # 境界制約の構築
         x0 = np.array(self.model.spatial_state[:])
-        if self.uses_steering_state:
-            x0 = np.append(x0, self.previous_steering)
         leq = np.hstack([-x0, uq])
         ueq = leq
 
         # 入力と状態の制約境界
-        lineq_basic = np.hstack([xmin_dyn, self._cached_umin_horizon])
+        lineq_basic = np.hstack([xmin_dyn, np.kron(np.ones(N), umin)])
         uineq_basic = np.hstack([xmax_dyn, umax_dyn])
 
-        # Legacy curvature-input MPC needs adjacent-input constraints. In the
-        # steering-state model delta_rate is already bounded in umin/umax.
-        lineq_rate = self._cached_rate_lower
-        uineq_rate = self._cached_rate_upper
+        # ステアリングレート制約の境界
+        max_delta_change = self.max_steering_rate * self.model.Ts
+        lineq_rate = -max_delta_change * np.ones(self.n_rate_constraints)
+        uineq_rate = max_delta_change * np.ones(self.n_rate_constraints)
 
         t_constraints2 = time.perf_counter()
 
@@ -1238,9 +623,9 @@ class MPC:
         P = self.P_base
 
         q = np.hstack([
-            -self._cached_q_state_diag * xr[:-self.nx],
+            -np.tile(np.diag(self.Q.toarray()), N) * xr[:-self.nx],
             -self.QN.dot(xr[-self.nx:]),
-            -self._cached_q_input_diag * ur
+            -np.tile(np.diag(self.R.toarray()), N) * ur
         ])
 
         t_vector = time.perf_counter()
@@ -1300,34 +685,16 @@ class MPC:
             self.vector = 0
             self.update = 0
                         
-    def get_control(self, *, max_infeasible_retries: int = 5) -> Tuple[np.ndarray, float]:
+    def get_control(self) -> Tuple[np.ndarray, float]:
         """
         Get control signal given the current position of the car.
-
-        ``max_infeasible_retries`` limits only the additional solves with a
-        relaxed safety margin.  The normal live controller keeps the legacy
-        default of five; callers such as Shadow MPC may use a smaller budget.
         """
-        max_infeasible_retries = max(int(max_infeasible_retries), 0)
         nx = self.nx
         nu = self.nu
         self.used_prediction_fallback = False
         self.time_budget_exceeded = False
         self.recovery_requested = False
         self.failure_reason = None
-        self.last_attempt_feasible = False
-        self.last_attempt_status = "not_solved"
-        self.last_attempt_initial_steering = float(self.previous_steering)
-        self.last_attempt_predicted_steering = np.array([], dtype=float)
-        self.last_attempt_steering_rate = np.array([], dtype=float)
-        self.last_attempt_command_steering = np.array([], dtype=float)
-        self.last_attempt_target_steering = np.array([], dtype=float)
-        self.last_attempt_steering_angle_margin = np.nan
-        self.last_attempt_steering_rate_margin = np.nan
-        self.last_solve_attempts = []
-        self.last_prediction_diagnostic = {
-            "valid": False, "reason": "not_evaluated"}
-        self.last_attempt_primal_infeasible = False
 
         #最近傍Waypointを取得
         self.model.get_current_waypoint()
@@ -1343,24 +710,6 @@ class MPC:
 
         base_wp_id = self.model.wp_id
         self._init_problem(N, self.model.safety_margin)
-        diagnostic_delta_limit = float(self.state_constraints['xmax'][3])
-        diagnostic_target_delta = []
-        for index in range(N + 1):
-            diagnostic_waypoint = self.model.reference_path.get_waypoint(
-                self.model.wp_id + index)
-            diagnostic_gain = understeer_curvature_gain(
-                diagnostic_waypoint.v_ref, self.understeer_coeff)
-            diagnostic_kappa = (
-                diagnostic_waypoint.kappa
-                / max(diagnostic_gain, 1e-3)
-            )
-            diagnostic_target_delta.append(float(np.clip(
-                math.atan(self.model.length * diagnostic_kappa),
-                -diagnostic_delta_limit,
-                diagnostic_delta_limit,
-            )))
-        self.last_attempt_target_steering = np.asarray(
-            diagnostic_target_delta, dtype=float)
 
         t1 = time.perf_counter()
         t2 = t1
@@ -1370,41 +719,28 @@ class MPC:
 
         try:
 
-            solve_started_at = time.perf_counter()
             dec = self.optimizer.solve()
-            self._record_osqp_attempt(
-                "initial", dec,
-                (time.perf_counter() - solve_started_at) * 1000.0,
-                self.model.safety_margin)
             if self.debug_counter % 20 == 0:
                 print(dec.info.status,flush=True)
             t2 = time.perf_counter()
 
             if is_primal_infeasible(dec):
-                self.last_attempt_primal_infeasible = True
-                self.primal_infeasible_event_count += 1
                 # Limit only the additional relaxed retries. The initial
                 # problem build and solve are normal MPC work and are not
                 # included in this deadline.
                 retry_started_at = time.perf_counter()
-                for i in range(1, max_infeasible_retries + 1):
+                for i in range(1, 6):
                     elapsed_ms = (
                         time.perf_counter() - retry_started_at) * 1000.0
                     if elapsed_ms >= self.solve_time_budget_ms:
                         self.time_budget_exceeded = True
-                        self.time_budget_exceeded_event_count += 1
                         break
                     relaxed_safety_margin = self.model.safety_margin * ((5-i) / 5.0)
                     # _init_problem applies wp_id_offset, so restore the
                     # unshifted waypoint before every retry.
                     self.model.wp_id = base_wp_id
                     self._init_problem(N, relaxed_safety_margin)
-                    solve_started_at = time.perf_counter()
                     dec = self.optimizer.solve()
-                    self._record_osqp_attempt(
-                        f"retry_{i}", dec,
-                        (time.perf_counter() - solve_started_at) * 1000.0,
-                        relaxed_safety_margin)
                     t2 = time.perf_counter()
 
                     if is_valid_osqp_solution(dec):
@@ -1415,7 +751,6 @@ class MPC:
                         break
 
             if not is_valid_osqp_solution(dec):
-                self.last_attempt_status = str(dec.info.status)
                 if self.time_budget_exceeded:
                     raise ValueError(
                         "MPC retry time budget exceeded "
@@ -1423,102 +758,34 @@ class MPC:
                 raise ValueError(
                     f"OSQP failed with status '{dec.info.status}'")
 
-            optimizer_controls = np.array(dec.x[-N*nu:])
+            control_signals = np.array(dec.x[-N*nu:])
+
+            # ステア角の計算と保存
+            control_signals[1::2] = np.arctan(control_signals[1::2] * self.model.length)
             x = np.reshape(dec.x[:(N+1)*nx], (N+1, nx))
             candidate_prediction = self.update_prediction(x, N)
-            self.last_prediction_diagnostic = diagnose_mpc_prediction(
+            if not is_plausible_mpc_prediction(
                 x,
                 candidate_prediction,
                 (self.model.temporal_state.x, self.model.temporal_state.y),
                 self._prediction_lower_bounds,
                 self._prediction_upper_bounds,
                 lateral_tolerance=self.prediction_lateral_tolerance,
+            ):
+                raise ValueError("OSQP returned an implausible prediction")
+
+            v = control_signals[0]
+            delta = control_signals[1]
+
+            # ステアレートの制限を適用
+            max_delta_change = self.max_steering_rate * self.model.Ts
+            delta = np.clip(
+                delta,
+                self.previous_steering - max_delta_change,
+                self.previous_steering + max_delta_change
             )
-            if not self.last_prediction_diagnostic["valid"]:
-                diagnostic_text = format_prediction_diagnostic(
-                    self.last_prediction_diagnostic)
-                print("[MPCPredictionReject] " + diagnostic_text, flush=True)
-                raise ValueError(
-                    "OSQP returned an implausible prediction: "
-                    + diagnostic_text)
-
-            if self.uses_steering_state:
-                # Expose [v, delta] to the existing controller/fallback code.
-                # There is one continuous steering-rate solution.  The state
-                # prediction samples it after each spatial interval (ds / v),
-                # while actuator commands sample the same rate every fixed Ts.
-                # These arrays must not be compared by index because their
-                # sample times are intentionally different.
-                control_signals = np.empty_like(optimizer_controls)
-                control_signals[0::nu] = optimizer_controls[0::nu]
-                predicted_delta = np.asarray(x[:, 3], dtype=float)
-                solved_delta_rate = np.asarray(
-                    optimizer_controls[1::nu], dtype=float)
-                command_delta = float(self.previous_steering)
-                for index, delta_rate in enumerate(solved_delta_rate):
-                    command_delta += float(delta_rate) * self.model.Ts
-                    command_delta = float(np.clip(
-                        command_delta,
-                        self.state_constraints['xmin'][3],
-                        self.state_constraints['xmax'][3],
-                    ))
-                    control_signals[index * nu + 1] = command_delta
-                command_delta_sequence = np.asarray(
-                    control_signals[1::nu], dtype=float)
-                delta_limit = float(self.state_constraints['xmax'][3])
-                self.last_attempt_predicted_steering = predicted_delta
-                self.last_attempt_steering_rate = solved_delta_rate
-                self.last_attempt_command_steering = command_delta_sequence
-                self.last_attempt_steering_angle_margin = float(
-                    delta_limit - np.max(np.abs(predicted_delta)))
-                self.last_attempt_steering_rate_margin = float(
-                    self.max_steering_rate
-                    - np.max(np.abs(solved_delta_rate)))
-                v = control_signals[0]
-                delta = control_signals[1]
-            else:
-                control_signals = optimizer_controls
-                control_signals[1::2] = np.arctan(
-                    control_signals[1::2] * self.model.length)
-                v = control_signals[0]
-                desired_first_delta = float(control_signals[1])
-
-                # Keep the complete stored command sequence consistent with
-                # the actuator. Previously only the live first command was
-                # clamped, while RViz/fallback/current_control retained the
-                # impossible unconstrained steering sequence.
-                max_delta_change = self.max_steering_rate * self.model.Ts
-                bounded_delta = float(self.previous_steering)
-                for index in range(N):
-                    desired_delta = float(control_signals[index * nu + 1])
-                    bounded_delta = float(np.clip(
-                        desired_delta,
-                        bounded_delta - max_delta_change,
-                        bounded_delta + max_delta_change,
-                    ))
-                    control_signals[index * nu + 1] = bounded_delta
-                delta = float(control_signals[1])
-
-                requested_change = abs(
-                    desired_first_delta - self.previous_steering)
-                self.steering_rate_limited = (
-                    requested_change > max_delta_change + 1e-6)
-                if self.steering_rate_limited:
-                    tracking_ratio = np.clip(
-                        max_delta_change / max(requested_change, 1e-6),
-                        0.0, 1.0)
-                    self.steering_rate_speed_cap = max(
-                        1.0, float(v) * float(tracking_ratio))
-                    v = min(float(v), self.steering_rate_speed_cap)
-                    control_signals[0] = v
-                    candidate_prediction = self._rollout_bounded_prediction(
-                        control_signals, N)
-                else:
-                    self.steering_rate_speed_cap = np.inf
 
             self.previous_steering = delta
-            self.last_attempt_feasible = True
-            self.last_attempt_status = str(dec.info.status)
 
             # Commit the candidate only after solver and geometry validation.
             self.current_control = control_signals
@@ -1534,8 +801,6 @@ class MPC:
 
         except (TypeError, ValueError) as error:
             self.failure_reason = str(error)
-            if self.last_attempt_status == "not_solved":
-                self.last_attempt_status = str(error)
             if self.debug_counter % 20 == 0:
                 print(f"[MPCFallback] {error}", flush=True)
             failure_cycle = self.infeasibility_counter + 1
@@ -1584,11 +849,6 @@ class MPC:
 
         self.debug_counter += 1
 
-        self.last_build_ms = (t1 - t0) * 1000.0
-        self.last_solve_ms = sum(
-            attempt["wall_solve_ms"] for attempt in self.last_solve_attempts)
-        self.last_total_ms = (time.perf_counter() - t0) * 1000.0
-
         '''
         if self.debug_counter % 20 == 0:    
                     print(
@@ -1616,36 +876,6 @@ class MPC:
 
         return u, max_delta
 
-    def _rollout_bounded_prediction(self, control_signals, N):
-        """Predict world motion using the steering commands actually usable."""
-        x = float(self.model.temporal_state.x)
-        y = float(self.model.temporal_state.y)
-        psi = float(self.model.temporal_state.psi)
-        x_pred, y_pred = [], []
-
-        for n in range(N):
-            current_waypoint = self.model.reference_path.get_waypoint(
-                self.model.wp_id + n)
-            next_waypoint = self.model.reference_path.get_waypoint(
-                self.model.wp_id + n + 1)
-            delta_s = max(float(next_waypoint - current_waypoint), 0.0)
-            speed = max(float(control_signals[n * self.nu]), 0.0)
-            delta = float(control_signals[n * self.nu + 1])
-            curvature_gain = understeer_curvature_gain(
-                speed, self.understeer_coeff)
-            heading_change = (
-                delta_s * curvature_gain * np.tan(delta)
-                / self.model.length)
-            mid_psi = psi + 0.5 * heading_change
-            x += delta_s * np.cos(mid_psi)
-            y += delta_s * np.sin(mid_psi)
-            psi += heading_change
-            if 1 <= n < N - 1:
-                x_pred.append(x)
-                y_pred.append(y)
-
-        return x_pred, y_pred
-
     def update_prediction(self, spatial_state_prediction, N):
         """
         Transform the predicted states to predicted x and y coordinates.
@@ -1664,8 +894,7 @@ class MPC:
                 get_waypoint(self.model.wp_id+n)
             # Transform predicted spatial state to temporal state
             predicted_temporal_state = self.model.s2t(associated_waypoint,
-                                            spatial_state_prediction[
-                                                n, :self.model_nx])
+                                            spatial_state_prediction[n, :])
 
             # Save predicted coordinates in world coordinate frame
             x_pred.append(predicted_temporal_state.x)

@@ -240,6 +240,39 @@ class StoppedVehicleSafetyTest(unittest.TestCase):
             candidate_is_relevant=False,
         ))
 
+    def test_target_switch_requires_configured_distance_advantage(self):
+        self.assertFalse(should_reset_overtake_latch_for_target_change(
+            active_target_id="d3",
+            candidate_target_id="d1",
+            candidate_is_relevant=True,
+            active_target_distance=10.0,
+            candidate_target_distance=8.0,
+            switch_margin_m=3.0,
+        ))
+        self.assertTrue(should_reset_overtake_latch_for_target_change(
+            active_target_id="d3",
+            candidate_target_id="d1",
+            candidate_is_relevant=True,
+            active_target_distance=10.0,
+            candidate_target_distance=7.0,
+            switch_margin_m=3.0,
+        ))
+
+    def test_overtake_distance_hysteresis_enters_at_15_releases_at_20(self):
+        self.assertTrue(is_follow_retry_within_distance(14.999, 15.0))
+        self.assertFalse(should_release_active_overtake_distance_gate(
+            outer_lane_active=True,
+            target_longitudinal=17.0,
+            distance=19.999,
+            max_distance=20.0,
+        ))
+        self.assertTrue(should_release_active_overtake_distance_gate(
+            outer_lane_active=True,
+            target_longitudinal=17.0,
+            distance=20.0,
+            max_distance=20.0,
+        ))
+
     def test_deadlock_escape_holds_until_pass_or_safe_distance(self):
         self.assertTrue(should_hold_follow_escape_exclusive(
             target_longitudinal=3.0,
