@@ -20,6 +20,8 @@ obstacles:
   radius: 1.25
 
 reference_path:
+  # 比較実験用。trueでは車幅未満の動的空間を障害物なしの静的境界へ戻すため衝突リスクがある。
+  unsafe_static_fallback_on_narrow: true
   update_by_topic: false # When true, 'circle' must be false
   # path from pkg share dir
   # csv_path: ""
@@ -51,7 +53,7 @@ reference_path:
 trajectory_switch:
   enter_center_wps: 18   # 前方車がこのWaypoint差未満ならCenterへ切り替え
   exit_center_wps: 20    # Center中はこのWaypoint差を超えるまで維持
-  overtake_latch_max_distance: 12.0 # [m] L0/L2の新規追い越しラッチを生成する最大実距離（この値未満のみ）
+  overtake_latch_max_distance: 17.0 # [m] L0/L2の新規追い越しラッチを生成する最大実距離（この値未満のみ）
   overtake_release_distance: 22.0 # [m] ラッチ後は20m以上で解除し、15m開始とのヒステリシスを持たせる
   overtake_target_switch_margin_m: 3.0 # [m] 現在対象よりこの距離以上近い候補にだけ切り替える
   center_lane_rejoin_behind_wps: 6 # 追い越した車が後方へこの差以上 離れたらCenter軌道のL1へ戻る
@@ -60,6 +62,8 @@ trajectory_switch:
   lane_change_cooldown_sec: 2.0 # L0/L1/L2の目標変更後、次の車線変更を禁止する時間
   exit_confirm_sec: 0.5  # Race復帰条件の継続確認時間
   race_rejoin_max_heading_deg: 10.0 # Race/Centerの方位差がこれ以下の地点でRaceへ復帰
+  race_rejoin_prohibited_zones: # Race WP基準。handoff/probeは継続し、実際のCenter→Race切替だけを禁止
+    - {start_wp: 245, end_wp: 275}
   race_rejoin_probe_start_heading_deg: 12.0 # [deg] この方位差以内でRace shadow probeを開始
   race_rejoin_probe_release_heading_deg: 15.0 # [deg] probe成功後はこの方位差まで成功状態を保持
   race_rejoin_direct_max_position_gap: 0.75 # [m] これ以下ならL1を介さずRace MPCを直接probe
@@ -73,6 +77,41 @@ trajectory_switch:
   race_rejoin_retry_backoff_sec: 2.0 # [s] Race probe失敗後の即時再試行を抑止
   outer_lane_release_infeasible_cycles: 5 # 追越し後、対象が後方にいる状態でこの回数連続失敗したらL0/L2固定を解除
   outer_lane_release_behind_m: 0.5 # 追越し後、対象が進行方向への射影でこの距離以上後方なら解除を許可
+  outer_failure_backoff_sec: 1.0 # [s] MPC失敗した外側車線を同じ追越し対象に対して再選択しない時間
+  outer_failure_backoff_wps: 8 # 時間経過前でもCenter軌道上でこのWaypoint数進めば再評価を許可
+  outer_switch_shadow_success_cycles: 3 # L0/L2反対側切替を確定する正確解の連続回数
+  outer_switch_shadow_guidance_success_cycles: 2 # 現在車線を解除して全幅soft誘導を始めるまでの連続正確解数
+  outer_switch_shadow_retry_interval_cycles: 3 # shadow MPCを実行する制御周期間隔
+  outer_switch_shadow_timeout_sec: 4.0 # [s] 計算余裕と正確解3回を待ち、確定できなければL1追従へ戻す
+  outer_switch_shadow_post_success_timeout_sec: 2.0 # [s] 初回正確解後のsoft ramp＋確定待ち保証（実効値は必要時間以上）
+  outer_switch_shadow_soft_ramp_sec: 0.5 # [s] 全幅保持中に反対車線方向へsoft参照を移す時間
+  outer_switch_shadow_min_cycle_slack_ms: 4.0 # [ms] live MPCを優先しつつ、以前の12msよりshadow実行機会を増やす
+  outer_lane_reevaluate_sec: 0.20 # [s] 追越し中に反対側外車線の安全度を再評価する周期
+  outer_lane_switch_confirm_sec: 0.35 # [s] 反対側が継続して安全な場合にshadowを開始するまでの確認時間
+  outer_lane_switch_score_margin: 1.0 # 現在車線より反対側を選ぶために必要な競合スコア差
+  outer_switch_max_lateral_speed: 1.0 # [m/s] 継続評価による反対側shadow開始時の最大横速度
+  outer_switch_max_yaw_rate: 1.2 # [rad/s] 継続評価による反対側shadow開始時の最大ヨーレート
+  outer_switch_max_heading_deg: 12.0 # [deg] 反対側候補軌道に対するshadow開始時の最大方位差
+  race_to_center_outer_handoff_start_timeout_sec: 2.0 # [s] Race→Center後にouter shadowを開始できない場合はL1追従へ戻す
+  outer_lane_curve_penalty_start: 0.15 # [1/m] 候補がコーナー外側にある場合のスコア加算開始曲率
+  outer_lane_curve_penalty_high: 0.19 # [1/m] 強い外側ペナルティを適用する曲率
+  outer_lane_curve_penalty_low_score: 2.0 # 中曲率のコーナー外側ペナルティ
+  outer_lane_curve_penalty_high_score: 5.0 # 高曲率のコーナー外側ペナルティ
+  outer_lane_curve_score_lookahead_wps: 10 # 曲率スコア専用の先読み。MPC N=25と分離し、コーナー手前約6mから評価
+  outer_lane_wall_clearance_penalty_m: 1.0 # [m] 候補車線中心から外壁までの距離がこれ未満なら加点
+  outer_lane_wall_clearance_reject_m: 0.7 # [m] 候補車線中心から外壁までの距離がこれ未満な候補は除外
+  outer_lane_wall_clearance_penalty_score: 3.0 # 外壁余裕不足のペナルティ
+  outer_lane_switch_penalty_score: 1.0 # 現在の外側車線から反対側へ移る場合のペナルティ
+  outer_switch_emergency_max_heading_deg: 20.0 # [deg] すべてのouter shadowハード確定を拒否する緊急方位差
+  outer_switch_emergency_max_lateral_speed: 2.0 # [m/s] ハード確定時の緊急拒否実測横速度
+  outer_switch_emergency_max_yaw_rate: 1.8 # [rad/s] ハード確定時の緊急拒否ヨーレート
+  outer_switch_prohibited_zones: # 動的障害物追跡中、高速でのL0<->L2横断を禁止するCenter WP区間
+    - {start_wp: 130, end_wp: 150}
+    - {start_wp: 245, end_wp: 275}
+  outer_switch_curve_allow_speed_kmh: 6.0 # [km/h] 追越し対象車がこの速度以下なら低速追越しを再許可
+  outer_switch_curve_block_speed_kmh: 7.0 # [km/h] 追越し対象車がこの速度以上なら禁止（6～7km/hは直前状態を維持）
+  outer_switch_curve_obstacle_range_m: 25.0 # [m] 追越し対象車がこの距離内にいる間だけゲートを適用
+  outer_switch_prohibited_entry_extra_sec: 0.0 # [s] 禁止区間進入予測へ確認時間+soft ramp以外に加える余裕
 
 prepass_lane_fallback:
   enabled: true
@@ -80,16 +119,16 @@ prepass_lane_fallback:
   recovery_stable_sec: 0.5 # 全幅解除後、MPC正常かつ候補車線基準の車両安定条件がこの時間続いてから代替車線を選択
   recovery_timeout_sec: 5.0 # 全幅回復がこの時間成立しなければラッチ対象を再評価。通過不可/後方危険なら追従、近すぎて通過可能なら後退後に再評価
   follow_retry_sec: 2.0 # [s] 追従へ移行後も、この周期で外側車線の通過幅とV2X競合を再評価する
-  follow_retry_max_distance: 12.0 # [m] 追従から追い越しを再評価する最大距離（この値未満のみ）
+  follow_retry_max_distance: 17.0 # [m] 追従から追い越しを再評価する最大距離（この値未満のみ）
   behind_release_longitudinal: 0.5 # [m] 対象がこの距離より後方にいる状態が継続したらPrepassを解除
   behind_release_confirm_sec: 0.25 # [s] V2X位置揺れで誤解除しないための後方判定継続時間
   max_heading_error_deg: 10.0 # [deg] 候補車線中心軌道に対するPrepass回復時の許容方位誤差
   heading_lookahead_wps: 3 # 候補車線中心軌道の方位を算出する前方Waypoint数
   commit_success_sec: 0.3 # [s] fallback車線をこの時間連続で正常に解けた場合だけ確定する
-  front_distance: 8.0  # [m] 候補車線の前方確認距離
-  side_distance: 2.0   # [m] 候補車線の側方・並走確認距離
-  rear_distance: 5.0   # [m] 候補車線の後方確認距離
-  prediction_sec: 1.0  # [s] 相対速度による将来位置も確認
+  front_distance: 15.0  # [m] 候補車線の前方確認距離
+  side_distance: 3.0   # [m] 候補車線の側方・並走確認距離
+  rear_distance: 6.0   # [m] 候補車線の後方確認距離
+  prediction_sec: 2.5  # [s] 相対速度による将来位置も確認
   follow_target_lost_hold_sec: 1.0 # [s] 追従中にラッチ対象が消えても最終位置を使って安全側に保持する時間
   follow_target_lost_max_speed: 1.0 # [m/s] 消失保持中の速度上限（保持期限後は一度停止して全車両再評価）
 
@@ -229,6 +268,8 @@ v2x_obstacle_avoidance:
   parallel_vehicle_half_width: 0.725 # [m] 並走横クリアランス用の相手車両半幅
   parallel_ego_half_length: 1.0     # [m] 自車の全長2.0mに対する半長
   parallel_vehicle_half_length: 1.0 # [m] 相手車の全長2.0mに対する半長
+  emergency_hard_stop_distance: 3.0 # [m] 前方車の中心距離がこれ以下なら速度指令を必ず0にする
+  emergency_hard_clearance: 0.10 # [m] 縦横の車体包絡間隔がともにこれ以下なら速度指令を必ず0にする
   parallel_critical_clearance: 0.30  # [m] 車両包絡間の実空きがこれ以下なら強減速
   parallel_warning_clearance: 1.30   # [m] 車両包絡間の実空きがこれ以下なら並走減速
   parallel_safety_longitudinal_clearance: 0.50 # [m] Safetyを許可する縦包絡間の最大空き
@@ -242,6 +283,20 @@ v2x_obstacle_avoidance:
   parallel_abort_arc_behind: 0.5     # [m] Center累積弧長によるAbort後方範囲
   parallel_abort_arc_ahead: 5.0      # [m]
   parallel_abort_sec: 4.0            # [s] 同じ車両との並走が継続する時間
+
+predictive_corridor_guard:
+  enabled: true
+  lookahead_wps: 40                  # Center約24m先まで。追加MPC/地図再探索は行わない
+  scan_interval_cycles: 2            # 通常20Hz、危険状態では毎周期
+  prediction_sec: 2.5                # [s] 同一到達時刻で比較する予測範囲（範囲外で相手位置を凍結しない）
+  warning_clearance: 0.5             # [m] 各車線を予測閉塞とみなす包絡余裕
+  hard_clearance: 0.1                # [m] 全車線閉塞かつこれ以下なら停止
+  release_clearance: 0.7             # [m] 解除側ヒステリシス
+  release_confirm_sec: 0.5           # [s] 安全状態の継続確認
+  deceleration: 2.0                  # [m/s^2] 閉塞までの距離から速度上限を計算
+  stop_margin: 3.0                   # [m] 閉塞地点より手前に残す停止余裕
+  hard_stop_distance: 6.0            # [m] hard_clearanceによる即時停止を近距離に限定
+  min_blocking_vehicles: 2           # 単独前走車では通常の追越しを妨げない
 
 stopped_vehicle_overtake:
   speed_threshold: 0.3     # [m/s] 前走車を停止とみなす速度
@@ -261,6 +316,9 @@ follow_restart:
 
 initial_start_boost:
   enabled: true            # Grounded/Ready配置で右側の赤色車線L0が自車のみなら、走り始めに最大加速度を適用
+  initialization_gate_enabled: true # 初期配置・初期姿勢確定までは停止指令だけを送る
+  initialization_settle_sec: 0.3 # [s] Grounded/Ready後のStartから姿勢を安定させる時間
+  initialization_snapshot_timeout_sec: 3.0 # [s] Grounded/Readyを受信できない場合のfail-open時間
   duration: 5.0            # [s] 車両の動き始めを検出してから初回だけ適用する時間
   turbo_enabled: true      # 動き始めにAWSIMターボを /awsim/cmd の [1.0]→[0.0] で初回だけONにする
   motion_speed_threshold: 0.1 # [m/s] 実速度がこの値に達した周期でターボと最大加速を開始

@@ -10,11 +10,13 @@ from multi_purpose_mpc_ros.v2x_vehicle_tracker import (
     circular_forward_progress,
     continuous_condition_confirmed,
     evaluate_stopped_lead_overtake,
+    emergency_hard_stop_required,
     follow_stop_deadlock_conditions_met,
     is_follow_target_ahead,
     is_follow_retry_within_distance,
     is_prepass_fallback_lane_change,
     lane_conflicts_are_clear,
+    lane_conflict_score,
     lateral_vehicle_clearance,
     longitudinal_vehicle_clearance,
     is_parallel_vehicle,
@@ -34,6 +36,7 @@ from multi_purpose_mpc_ros.v2x_vehicle_tracker import (
     should_count_mpc_recovery_success,
     should_recover_from_mpc_stall,
     should_hold_follow_escape_exclusive,
+    should_abort_overtake_for_distant_lead,
     should_release_active_overtake_distance_gate,
     should_reset_overtake_latch_for_target_change,
     should_reset_motion_latch,
@@ -258,7 +261,7 @@ class StoppedVehicleSafetyTest(unittest.TestCase):
             switch_margin_m=3.0,
         ))
 
-    def test_overtake_distance_hysteresis_enters_at_15_releases_at_20(self):
+    def test_overtake_distance_hysteresis_does_not_release_ahead_target(self):
         self.assertTrue(is_follow_retry_within_distance(14.999, 15.0))
         self.assertFalse(should_release_active_overtake_distance_gate(
             outer_lane_active=True,
@@ -266,7 +269,27 @@ class StoppedVehicleSafetyTest(unittest.TestCase):
             distance=19.999,
             max_distance=20.0,
         ))
-        self.assertTrue(should_release_active_overtake_distance_gate(
+        self.assertTrue(should_abort_overtake_for_distant_lead(
+            outer_lane_active=True,
+            target_longitudinal=17.0,
+            distance=20.0,
+            max_distance=20.0,
+        ))
+
+    def test_distant_lead_abort_is_not_triggered_after_actual_pass(self):
+        self.assertFalse(should_abort_overtake_for_distant_lead(
+            outer_lane_active=True,
+            target_longitudinal=-0.1,
+            distance=25.0,
+            max_distance=20.0,
+        ))
+        self.assertFalse(should_abort_overtake_for_distant_lead(
+            outer_lane_active=False,
+            target_longitudinal=25.0,
+            distance=25.0,
+            max_distance=20.0,
+        ))
+        self.assertFalse(should_release_active_overtake_distance_gate(
             outer_lane_active=True,
             target_longitudinal=17.0,
             distance=20.0,
@@ -292,6 +315,29 @@ class StoppedVehicleSafetyTest(unittest.TestCase):
 
 
 class PrepassSafetyRecoveryTest(unittest.TestCase):
+    def test_emergency_hard_stop_uses_distance_or_envelope_clearance(self):
+        self.assertTrue(emergency_hard_stop_required(
+            distance=3.0,
+            hard_stop_distance=3.0,
+            lateral_clearance=1.0,
+            longitudinal_clearance=1.0,
+            hard_clearance=0.1,
+        ))
+        self.assertTrue(emergency_hard_stop_required(
+            distance=4.0,
+            hard_stop_distance=3.0,
+            lateral_clearance=0.08,
+            longitudinal_clearance=0.05,
+            hard_clearance=0.1,
+        ))
+        self.assertFalse(emergency_hard_stop_required(
+            distance=4.0,
+            hard_stop_distance=3.0,
+            lateral_clearance=0.08,
+            longitudinal_clearance=0.2,
+            hard_clearance=0.1,
+        ))
+
     def test_recovery_success_is_not_counted_during_reverse(self):
         self.assertFalse(should_count_mpc_recovery_success(
             stuck_recovery_active=True,
@@ -350,20 +396,20 @@ class PrepassSafetyRecoveryTest(unittest.TestCase):
         self.assertFalse(is_follow_retry_within_distance(10.0, 10.0))
         self.assertFalse(is_follow_retry_within_distance(10.001, 10.0))
 
-    def test_active_outer_lane_releases_when_ahead_target_exits_gate(self):
+    def test_active_outer_lane_releases_only_after_target_is_behind(self):
         self.assertFalse(should_release_active_overtake_distance_gate(
             outer_lane_active=True,
             target_longitudinal=9.0,
             distance=9.999,
             max_distance=10.0,
         ))
-        self.assertTrue(should_release_active_overtake_distance_gate(
+        self.assertFalse(should_release_active_overtake_distance_gate(
             outer_lane_active=True,
             target_longitudinal=10.0,
             distance=10.0,
             max_distance=10.0,
         ))
-        self.assertFalse(should_release_active_overtake_distance_gate(
+        self.assertTrue(should_release_active_overtake_distance_gate(
             outer_lane_active=True,
             target_longitudinal=-0.1,
             distance=12.0,
@@ -376,19 +422,24 @@ class PrepassSafetyRecoveryTest(unittest.TestCase):
             max_distance=10.0,
         ))
 
-    def test_active_prepass_releases_immediately_at_distance_gate(self):
+    def test_active_prepass_distance_gate_requires_target_behind(self):
         self.assertFalse(should_release_prepass_distance_gate(
-            recovery_active=True, distance=9.999, max_distance=10.0))
+            recovery_active=True, target_longitudinal=-1.0,
+            distance=9.999, max_distance=10.0))
+        self.assertFalse(should_release_prepass_distance_gate(
+            recovery_active=True, target_longitudinal=10.0,
+            distance=10.0, max_distance=10.0))
         self.assertTrue(should_release_prepass_distance_gate(
-            recovery_active=True, distance=10.0, max_distance=10.0))
-        self.assertTrue(should_release_prepass_distance_gate(
-            recovery_active=True, distance=12.0, max_distance=10.0))
+            recovery_active=True, target_longitudinal=-0.1,
+            distance=12.0, max_distance=10.0))
 
     def test_missing_distance_does_not_confirm_prepass_gate_exit(self):
         self.assertFalse(should_release_prepass_distance_gate(
-            recovery_active=True, distance=None, max_distance=10.0))
+            recovery_active=True, target_longitudinal=-1.0,
+            distance=None, max_distance=10.0))
         self.assertFalse(should_release_prepass_distance_gate(
-            recovery_active=False, distance=12.0, max_distance=10.0))
+            recovery_active=False, target_longitudinal=-1.0,
+            distance=12.0, max_distance=10.0))
 
     def test_prepass_behind_release_requires_continuous_confirmation(self):
         since = update_continuous_condition_since(
@@ -567,6 +618,18 @@ class PrepassFallbackLaneChangeTest(unittest.TestCase):
 
 
 class OvertakeGeometryTest(unittest.TestCase):
+    def test_lane_conflict_score_prioritizes_side_then_front_then_rear(self):
+        self.assertEqual(lane_conflict_score({}), 0.0)
+        self.assertEqual(lane_conflict_score({"rear": [1]}), 2.0)
+        self.assertEqual(lane_conflict_score({"front": [1]}), 3.0)
+        self.assertEqual(lane_conflict_score({"side": [1]}), 5.0)
+        self.assertEqual(
+            lane_conflict_score({
+                "front": [1], "side": [2], "rear": [3, 4]
+            }),
+            12.0,
+        )
+
     def parallel(self, **overrides):
         values = {
             "ego_lane_idx": 0,

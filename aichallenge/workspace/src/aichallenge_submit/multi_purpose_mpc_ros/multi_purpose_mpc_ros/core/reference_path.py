@@ -321,6 +321,13 @@ class ReferencePath:
                 "waypoint_bounds_center.csv"
             )
 
+        # Free-space scans are reusable until the shared occupancy map is
+        # rebuilt. This avoids rasterizing the same waypoint/lane repeatedly
+        # at the controller rate between obstacle updates.
+        self._free_segment_cache = {}
+        self.unsafe_static_fallback_on_narrow = False
+        self.unsafe_static_fallback_wp_ids = []
+
         # Compute path width (attribute of each waypoint)
         self._compute_width(max_width=max_width)
 
@@ -351,6 +358,8 @@ class ReferencePath:
         self.border_cells.dynamic_lower_bounds = np.array(dynamic_lower_bounds).reshape(n_rows, n_cols, 2)
 
     def reset_dynamic_constraints(self):
+        self._free_segment_cache.clear()
+        self.unsafe_static_fallback_wp_ids = []
         for wp in self.waypoints:
             wp.dynamic_border_cells = wp.static_border_cells
             wp.ub_sm = wp.ub
@@ -1108,10 +1117,20 @@ class ReferencePath:
         :return: segment candidates as list of tuples (ub_cell, lb_cell)
         """
 
+        target_lane = getattr(self, 'target_lane_idx', None)
+        cache_key = None
+        if wp_idx is not None:
+            cache_key = (
+                int(wp_idx) % self.n_waypoints,
+                target_lane,
+                round(float(min_width), 6),
+            )
+            cached = self._free_segment_cache.get(cache_key)
+            if cached is not None:
+                return list(cached)
+
         # Candidate segments
         free_segments = []
-
-        target_lane = getattr(self, 'target_lane_idx', None)
 
         if target_lane is not None and wp_idx is not None:
             # 追い越し中（target_lane が設定されているとき）
@@ -1198,7 +1217,9 @@ class ReferencePath:
             if widest_width_sq >= min_width**2:
                 free_segments.append(widest_segment)
 
-        return free_segments
+        if cache_key is not None:
+            self._free_segment_cache[cache_key] = tuple(free_segments)
+        return list(free_segments)
 
     def update_simple_path_constraints(self, N, safety_margin):
         upper_bounds = []
@@ -1365,10 +1386,21 @@ class ReferencePath:
             # Use the zero-width sentinel and let the existing infeasibility
             # recovery stop/replan safely.
             if segment_length_sm < min_segment_length:
-                ub = 0.0
-                lb = 0.0
-                upper_margin = 0.0
-                lower_margin = 0.0
+                if self.unsafe_static_fallback_on_narrow:
+                    # Latest-compatible comparison mode. This deliberately
+                    # removes the obstacle-narrowed corridor at this waypoint
+                    # and is unsafe when the obstacle is real.
+                    ub, lb = wp.ub, wp.lb
+                    upper_margin, lower_margin = lane_constraint_margins(
+                        target_lane, safety_margin)
+                    fallback_wp = int(wp_id + len(ub_hor)) % self.n_waypoints
+                    if fallback_wp not in self.unsafe_static_fallback_wp_ids:
+                        self.unsafe_static_fallback_wp_ids.append(fallback_wp)
+                else:
+                    ub = 0.0
+                    lb = 0.0
+                    upper_margin = 0.0
+                    lower_margin = 0.0
 
             # Subtract safety margin
             ub_sm = ub - upper_margin
