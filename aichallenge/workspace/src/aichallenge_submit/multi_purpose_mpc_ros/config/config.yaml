@@ -54,6 +54,10 @@ trajectory_switch:
   enter_center_wps: 18   # 前方車がこのWaypoint差未満ならCenterへ切り替え
   exit_center_wps: 20    # Center中はこのWaypoint差を超えるまで維持
   overtake_latch_max_distance: 17.0 # [m] L0/L2の新規追い越しラッチを生成する最大実距離（この値未満のみ）
+  slow_lead_overtake_speed_kmh: 8.0 # [km/h] 停止車判定と分離した超低速前方車の早期shadow対象上限
+  slow_lead_overtake_probe_min_distance: 12.0 # [m] 12〜17mで早期検出し、12m未満でも対象が継続すれば保持
+  slow_lead_overtake_probe_max_distance: 17.0 # [m] 超低速車の早期shadow開始距離
+  slow_lead_overtake_probe_speed_margin: 0.5 # [m/s] shadow/liveの上限を対象速度に加える小さな接近余裕
   overtake_release_distance: 22.0 # [m] ラッチ後は20m以上で解除し、15m開始とのヒステリシスを持たせる
   overtake_target_switch_margin_m: 3.0 # [m] 現在対象よりこの距離以上近い候補にだけ切り替える
   center_lane_rejoin_behind_wps: 6 # 追い越した車が後方へこの差以上 離れたらCenter軌道のL1へ戻る

@@ -667,6 +667,15 @@ class MPCController(Node):
             getattr(switch_cfg, "exit_center_wps", 35))
         self._overtake_latch_max_distance = max(float(getattr(
             switch_cfg, "overtake_latch_max_distance", 10.0)), 0.0)
+        self._slow_lead_overtake_speed = max(float(getattr(
+            switch_cfg, "slow_lead_overtake_speed_kmh", 8.0)) / 3.6, 0.0)
+        self._slow_lead_probe_min_distance = max(float(getattr(
+            switch_cfg, "slow_lead_overtake_probe_min_distance", 12.0)), 0.0)
+        self._slow_lead_probe_max_distance = max(float(getattr(
+            switch_cfg, "slow_lead_overtake_probe_max_distance", 17.0)),
+            self._slow_lead_probe_min_distance)
+        self._slow_lead_probe_speed_margin = max(float(getattr(
+            switch_cfg, "slow_lead_overtake_probe_speed_margin", 0.5)), 0.0)
         self._overtake_release_distance = max(float(getattr(
             switch_cfg, "overtake_release_distance",
             self._overtake_latch_max_distance)),
@@ -918,6 +927,9 @@ class MPCController(Node):
         self._outer_switch_shadow_race_to_center = False
         self._outer_switch_shadow_success_cycles = 0
         self._outer_switch_shadow_retry_countdown = 0
+        self._outer_switch_shadow_speed_limit = None
+        self._slow_lead_overtake_target_id = None
+        self._outer_curve_gate_rejected_this_cycle = False
         self._outer_shadow_timeout_l1_rejoin_active = False
         self._outer_shadow_timeout_l1_start_e_y = None
         self._outer_shadow_source_unsafe_recovery_active = False
@@ -3049,6 +3061,7 @@ class MPCController(Node):
         self._outer_switch_shadow_race_to_center = False
         self._outer_switch_shadow_success_cycles = 0
         self._outer_switch_shadow_retry_countdown = 0
+        self._outer_switch_shadow_speed_limit = None
         self._mpcN_center.set_soft_lateral_reference()
         probe = self._mpcN_outer_switch_probe
         probe.osqp_initialized = False
@@ -3057,6 +3070,33 @@ class MPCController(Node):
         probe.used_prediction_fallback = False
         probe.recovery_requested = False
         probe.infeasibility_counter = 0
+
+    def _target_center_longitudinal_speed(self, target_id):
+        """Return fresh target progress speed along Center, or None."""
+        if (
+            target_id is None
+            or not hasattr(self, "_v2x_tracker")
+            or target_id not in self._v2x_tracker.active_vehicle_ids()
+            or not self._v2x_tracker.has_velocity_estimate(target_id)
+        ):
+            return None
+        samples = self._v2x_tracker._samples.get(target_id)
+        if not samples:
+            return None
+        _, vehicle_x, vehicle_y = samples[-1]
+        velocity_x, velocity_y = self._v2x_tracker.velocity(target_id)
+        target_wp = self._carN_center.get_closest_waypoint(vehicle_x, vehicle_y)
+        heading = self._reference_pathN_center.get_waypoint(target_wp).psi
+        return max(
+            velocity_x * math.cos(heading) + velocity_y * math.sin(heading),
+            0.0,
+        )
+
+    def _slow_lead_probe_speed_limit(self, target_id):
+        target_speed = self._target_center_longitudinal_speed(target_id)
+        if target_speed is None or target_speed > self._slow_lead_overtake_speed:
+            return None
+        return max(target_speed + self._slow_lead_probe_speed_margin, 0.5)
 
     def _reset_outer_lane_reevaluation(self) -> None:
         self._outer_lane_last_reevaluate_at = None
@@ -3266,6 +3306,7 @@ class MPCController(Node):
             and lane_idx in (0, 2)
             and from_lane_idx != lane_idx
         ):
+            self._outer_curve_gate_rejected_this_cycle = True
             self.get_logger().warn(
                 "[OuterSwitchCurveGateReject] refusing L0<->L2 shadow start "
                 f"inside a protected curve: L{from_lane_idx}->L{lane_idx}",
@@ -3280,6 +3321,7 @@ class MPCController(Node):
             enters_zone, zone_wp, arc_distance = (
                 self._outer_shadow_will_enter_prohibited_zone())
             if enters_zone and not self._outer_shadow_target_is_low_speed():
+                self._outer_curve_gate_rejected_this_cycle = True
                 self.get_logger().warn(
                     "[OuterSwitchPredictedCurveGateReject] refusing L0<->L2 "
                     "shadow because its confirm+ramp horizon enters a "
@@ -3304,6 +3346,9 @@ class MPCController(Node):
         self._outer_switch_shadow_from_lane_idx = int(from_lane_idx)
         self._outer_switch_shadow_lane_idx = int(lane_idx)
         self._outer_switch_shadow_target_id = self._overtake_target_vehicle_id
+        self._outer_switch_shadow_speed_limit = (
+            self._slow_lead_probe_speed_limit(
+                self._outer_switch_shadow_target_id))
         self._outer_switch_shadow_hold_current_lane = bool(hold_current_lane)
         self._outer_switch_shadow_race_to_center = bool(
             race_to_center_handoff)
@@ -3329,6 +3374,11 @@ class MPCController(Node):
             f"{self._outer_switch_shadow_guidance_success_cycles_required}, "
             f"probe_interval="
             f"{self._outer_switch_shadow_retry_interval_cycles}cycles"
+            + (
+                f", slow_lead_speed_limit="
+                f"{self._outer_switch_shadow_speed_limit:.2f}m/s"
+                if self._outer_switch_shadow_speed_limit is not None else ""
+            )
         )
         return True
 
@@ -3721,6 +3771,16 @@ class MPCController(Node):
                 predicted_pose.x, predicted_pose.y, predicted_pose.theta)
             probe.update_wp_id_offset(0)
             probe.previous_steering = self._mpcN_center.previous_steering
+            if self._outer_switch_shadow_speed_limit is not None:
+                # A normal-speed shadow can catch a slow lead before it has
+                # acquired lateral separation and falsely fail target_clear.
+                # Match the lead during probing; hard commit still requires
+                # the same exact-solution and safety guards as every pass.
+                probe.update_v_max(self._outer_switch_shadow_speed_limit)
+            else:
+                # The probe MPC is persistent. Explicitly restore its normal
+                # limit after a previous slow-lead manoeuvre.
+                probe.update_v_max(float(self._mpc_cfg_center.v_max))
             probe.get_control()
             target_clear = self._prediction_is_clear_for_mpc(
                 probe, self._outer_switch_shadow_target_id)
@@ -6385,8 +6445,34 @@ class MPCController(Node):
         wp_temp = self._carN_race.get_closest_waypoint(pose.x, pose.y)
         center_wp_temp = self._carN_center.get_closest_waypoint(pose.x, pose.y)
         curve_outer_hold_lane_idx = None
+        # A CurveGate rejection owns lateral selection for this complete
+        # control cycle. It is reset only here, never by a downstream selector.
+        self._outer_curve_gate_rejected_this_cycle = False
         outer_switch_curve_blocked = self._update_outer_switch_curve_block(
             pose, center_wp_temp)
+        applied_outer_lane = (
+            int(self._target_lane_idx)
+            if self._target_lane_idx in (0, 2) else None)
+        queued_outer_lanes = {
+            int(lane_idx) for lane_idx in (
+                self._prepass_fallback_commit_lane_idx,
+                self._prepass_fallback_lane_idx,
+                self._overtake_lane_idx,
+            ) if lane_idx in (0, 2)
+        }
+        if (
+            outer_switch_curve_blocked
+            and applied_outer_lane in (0, 2)
+            and any(
+                lane_idx != applied_outer_lane
+                for lane_idx in queued_outer_lanes
+            )
+        ):
+            # A commit may have been queued in the preceding cycle just before
+            # the protected-zone gate became active. Treat that stale request
+            # exactly like an explicit shadow rejection.
+            self._outer_curve_gate_rejected_this_cycle = True
+            curve_outer_hold_lane_idx = applied_outer_lane
         if (
             outer_switch_curve_blocked
             and self._outer_switch_shadow_from_lane_idx in (0, 2)
@@ -6394,6 +6480,7 @@ class MPCController(Node):
             and self._outer_switch_shadow_from_lane_idx
                 != self._outer_switch_shadow_lane_idx
         ):
+            self._outer_curve_gate_rejected_this_cycle = True
             curve_outer_hold_lane_idx = int(
                 self._outer_switch_shadow_from_lane_idx)
             blocked_source = curve_outer_hold_lane_idx
@@ -6403,6 +6490,11 @@ class MPCController(Node):
             current_e_y = float(self._carN_center.spatial_state.e_y)
             self._reset_outer_switch_shadow()
             self._reset_outer_lane_reevaluation()
+            self._prepass_fallback_commit_pending = False
+            self._prepass_fallback_commit_lane_idx = None
+            self._prepass_fallback_commit_success_since = None
+            self._race_to_center_outer_handoff_pending = False
+            self._race_to_center_outer_handoff_started_at = None
             if guidance_had_started:
                 # Once full-width soft movement has begun, reinstating the
                 # source hard lane can itself cause an abrupt correction.
@@ -7641,6 +7733,34 @@ class MPCController(Node):
             and opponent_velocity_valid
             and opponent_v_lead < self._stopped_lead_speed_threshold
         )
+        slow_lead_speed = self._target_center_longitudinal_speed(
+            opponent_vehicle_id)
+        slow_lead_overtake_active = bool(
+            opponent_ahead_detected
+            and opponent_vehicle_id is not None
+            and slow_lead_speed is not None
+            and slow_lead_speed <= self._slow_lead_overtake_speed
+            and opponent_distance <= self._slow_lead_probe_max_distance
+        )
+        if slow_lead_overtake_active:
+            if self._slow_lead_overtake_target_id != opponent_vehicle_id:
+                self.get_logger().warn(
+                    "[SlowLeadOvertakeAssist] detected an <=8km/h lead "
+                    "inside the early shadow gate; selecting a clear outer "
+                    "lane and matching probe speed until lateral separation: "
+                    f"vehicle_id={opponent_vehicle_id}, speed="
+                    f"{slow_lead_speed * 3.6:.1f}km/h, distance="
+                    f"{opponent_distance:.2f}m, early_window="
+                    f"{self._slow_lead_probe_min_distance:.1f}-"
+                    f"{self._slow_lead_probe_max_distance:.1f}m"
+                )
+            self._slow_lead_overtake_target_id = opponent_vehicle_id
+        elif (
+            self._slow_lead_overtake_target_id is not None
+            and self._outer_switch_shadow_target_id
+                != self._slow_lead_overtake_target_id
+        ):
+            self._slow_lead_overtake_target_id = None
         active_overtake_target_id = (
             self._overtake_target_vehicle_id
             if self._overtake_target_vehicle_id is not None
@@ -9183,6 +9303,43 @@ class MPCController(Node):
                     throttle_duration_sec=1.0,
                 )
 
+        if self._outer_curve_gate_rejected_this_cycle:
+            # CurveGate is a cycle-wide veto, not merely a failed function
+            # call. Remove every independently queued path to a hard outer
+            # boundary so Prepass/ordinary selection cannot commit it later
+            # in this same cycle (the failure seen as Reject -> LaneChange).
+            self._reset_outer_switch_shadow()
+            self._reset_outer_lane_reevaluation()
+            self._prepass_fallback_commit_pending = False
+            self._prepass_fallback_commit_lane_idx = None
+            self._prepass_fallback_commit_success_since = None
+            self._race_to_center_outer_handoff_pending = False
+            self._race_to_center_outer_handoff_started_at = None
+            if self._outer_shadow_timeout_l1_rejoin_active:
+                # Soft guidance had already moved away from its source. Keep
+                # full width and let the gradual L1 return own the recovery.
+                new_target_lane_idx = None
+                self._overtake_lane_idx = None
+                self._prepass_fallback_lane_idx = None
+            elif prev_lane_idx in (0, 2):
+                # A proven source outer lane is safer than an abrupt release.
+                new_target_lane_idx = int(prev_lane_idx)
+                self._overtake_lane_idx = int(prev_lane_idx)
+                self._prepass_fallback_lane_idx = None
+            else:
+                # L1/full-width may not acquire a new hard outer boundary in
+                # the rejected cycle.
+                new_target_lane_idx = (
+                    int(prev_lane_idx) if prev_lane_idx == 1 else None)
+                self._overtake_lane_idx = None
+                self._prepass_fallback_lane_idx = None
+            self.get_logger().warn(
+                "[OuterSwitchCurveGateCycleVeto] cleared shadow, Prepass "
+                "commit, handoff and pending outer request for this cycle; "
+                f"holding={'full_width' if new_target_lane_idx is None else 'L' + str(new_target_lane_idx)}",
+                throttle_duration_sec=1.0,
+            )
+
         if curve_outer_hold_lane_idx in (0, 2):
             new_target_lane_idx = curve_outer_hold_lane_idx
 
@@ -9232,6 +9389,11 @@ class MPCController(Node):
             # A stationary lead must not remain trapped behind the normal
             # lane-change cooldown when a passing side is available.
             if lead_is_stationary and new_target_lane_idx in (0, 2):
+                can_change_lane = True
+            # This does not hard-apply the outer boundary: it only lets the
+            # verified Race->Center shadow handoff begin without spending the
+            # ordinary lane-change cooldown behind an <=8km/h lead.
+            if slow_lead_overtake_active and new_target_lane_idx in (0, 2):
                 can_change_lane = True
             # Race return must release the old outer-lane constraint immediately.
             if not opponent_ahead_detected and new_target_lane_idx is None:
@@ -9808,6 +9970,29 @@ class MPCController(Node):
                 self._mpc_cfg.v_max)
         else:
             ref_vel_kmph = self._mpc_cfg.v_max
+
+        slow_lead_live_speed_limit = None
+        slow_lead_live_target_id = (
+            self._outer_switch_shadow_target_id
+            if self._outer_switch_shadow_target_id is not None else
+            self._slow_lead_overtake_target_id
+        )
+        if slow_lead_live_target_id is not None:
+            slow_lead_live_speed_limit = self._slow_lead_probe_speed_limit(
+                slow_lead_live_target_id)
+        if slow_lead_live_speed_limit is not None:
+            # Prevent the live Center solution from consuming the longitudinal
+            # gap while the speed-matched outer probe obtains its 2/3 exact
+            # confirmations. Existing emergency/parallel limits below remain
+            # authoritative and may reduce this all the way to zero.
+            ref_vel_kmph = min(ref_vel_kmph, slow_lead_live_speed_limit)
+            self.get_logger().info(
+                "[SlowLeadOvertakeSpeedMatch] limiting approach speed while "
+                "outer shadow is prepared/confirmed: vehicle_id="
+                f"{slow_lead_live_target_id}, limit="
+                f"{slow_lead_live_speed_limit:.2f}m/s",
+                throttle_duration_sec=1.0,
+            )
 
         emergency_brake_active = False
         emergency_brake_vehicle_id = None
@@ -10516,6 +10701,10 @@ class MPCController(Node):
                 ref_vel_kmph,
                 float(getattr(
                     self._cfg.mpc, "safety_recovery_speed", 1.0)))
+        if slow_lead_live_speed_limit is not None:
+            # Re-apply after ACC restart/initial boost and every ordinary
+            # longitudinal override. Safety limiters below may only reduce it.
+            ref_vel_kmph = min(ref_vel_kmph, slow_lead_live_speed_limit)
         unsafe_static_fallback_active = bool(getattr(
             self._reference_path, "unsafe_static_fallback_wp_ids", []))
         if unsafe_static_fallback_active:
