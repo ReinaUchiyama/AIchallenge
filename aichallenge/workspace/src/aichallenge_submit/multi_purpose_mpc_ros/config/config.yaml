@@ -51,7 +51,7 @@ reference_path:
 trajectory_switch:
   enter_center_wps: 18   # 前方車がこのWaypoint差未満ならCenterへ切り替え
   exit_center_wps: 20    # Center中はこのWaypoint差を超えるまで維持
-  overtake_latch_max_distance: 15.0 # [m] L0/L2の新規追い越しラッチを生成する最大実距離（この値未満のみ）
+  overtake_latch_max_distance: 12.0 # [m] L0/L2の新規追い越しラッチを生成する最大実距離（この値未満のみ）
   overtake_release_distance: 22.0 # [m] ラッチ後は20m以上で解除し、15m開始とのヒステリシスを持たせる
   overtake_target_switch_margin_m: 3.0 # [m] 現在対象よりこの距離以上近い候補にだけ切り替える
   center_lane_rejoin_behind_wps: 6 # 追い越した車が後方へこの差以上 離れたらCenter軌道のL1へ戻る
@@ -60,6 +60,17 @@ trajectory_switch:
   lane_change_cooldown_sec: 2.0 # L0/L1/L2の目標変更後、次の車線変更を禁止する時間
   exit_confirm_sec: 0.5  # Race復帰条件の継続確認時間
   race_rejoin_max_heading_deg: 10.0 # Race/Centerの方位差がこれ以下の地点でRaceへ復帰
+  race_rejoin_probe_start_heading_deg: 12.0 # [deg] この方位差以内でRace shadow probeを開始
+  race_rejoin_probe_release_heading_deg: 15.0 # [deg] probe成功後はこの方位差まで成功状態を保持
+  race_rejoin_direct_max_position_gap: 0.75 # [m] これ以下ならL1を介さずRace MPCを直接probe
+  race_rejoin_probe_success_cycles: 3 # Race MPCがこの回数連続で正確に解けた場合だけRaceへ切り替える
+  race_handoff_ramp_sec: 1.5 # [s] 位置差が大きい場合にRace参照へ移す最低時間
+  race_handoff_max_reference_speed: 0.7 # [m/s] 全幅制約中のRace参照への最大横移動速度
+  race_handoff_max_position_gap: 3.0 # [m] これを超えるRace横目標は対応誤りとして既存L1復帰へ戻す
+  race_handoff_max_target_step: 0.75 # [m/wp] 予測区間内でこれを超えて飛ぶRace横目標を使用しない
+  race_handoff_guard_extra_lookahead_wps: 10 # MPC予測区間に加えて先行検査するWaypoint数
+  race_rejoin_probe_timeout_sec: 1.0 # [s] Race probe不成立時は既存のL1復帰へ戻す
+  race_rejoin_retry_backoff_sec: 2.0 # [s] Race probe失敗後の即時再試行を抑止
   outer_lane_release_infeasible_cycles: 5 # 追越し後、対象が後方にいる状態でこの回数連続失敗したらL0/L2固定を解除
   outer_lane_release_behind_m: 0.5 # 追越し後、対象が進行方向への射影でこの距離以上後方なら解除を許可
 
@@ -69,7 +80,7 @@ prepass_lane_fallback:
   recovery_stable_sec: 0.5 # 全幅解除後、MPC正常かつ候補車線基準の車両安定条件がこの時間続いてから代替車線を選択
   recovery_timeout_sec: 5.0 # 全幅回復がこの時間成立しなければラッチ対象を再評価。通過不可/後方危険なら追従、近すぎて通過可能なら後退後に再評価
   follow_retry_sec: 2.0 # [s] 追従へ移行後も、この周期で外側車線の通過幅とV2X競合を再評価する
-  follow_retry_max_distance: 18.0 # [m] 追従から追い越しを再評価する最大距離（この値未満のみ）
+  follow_retry_max_distance: 12.0 # [m] 追従から追い越しを再評価する最大距離（この値未満のみ）
   behind_release_longitudinal: 0.5 # [m] 対象がこの距離より後方にいる状態が継続したらPrepassを解除
   behind_release_confirm_sec: 0.25 # [s] V2X位置揺れで誤解除しないための後方判定継続時間
   max_heading_error_deg: 10.0 # [deg] 候補車線中心軌道に対するPrepass回復時の許容方位誤差
@@ -84,10 +95,10 @@ prepass_lane_fallback:
 
 follow_control:
   follow_only: false       # true: L0/L2へ追い越さず、Center軌道のL1で追従する
-  engage_distance: 15.0  # [m] この距離未満で車間制御を有効化
-  desired_distance: 8.0  # [m] 目標車間距離
+  engage_distance: 12.0  # [m] この距離未満で車間制御を有効化
+  desired_distance: 6.5  # [m] 目標車間距離
   lateral_distance: 1.2  # [m] 同一車線とみなす横方向距離
-  spacing_kp: 1.2        # [1/s] target=front_speed+Kp*(distance-desired_distance)
+  spacing_kp: 1.0        # [1/s] target=front_speed+Kp*(distance-desired_distance)
   deadlock_escape_enabled: true # 追従対象と自車が停止した際に安全な前進probe/後退で脱出
   deadlock_ego_speed_threshold: 0.15 # [m/s]
   deadlock_lead_speed_threshold: 0.3 # [m/s]
@@ -110,7 +121,7 @@ center_lane_rejoin_stability:
   stable_sec: 0.3            # 全条件が連続成立してからL1復帰を開始
   max_l1_lateral_error: 0.4 # [m] L1中心からの横誤差がこの値未満の場合だけprobeを開始
   prediction_fit_points: 0  # 0なら全幅MPC予測の全点をL1内判定に使用
-  prediction_fit_ratio: 1.0 # 全予測点の車両中心がL1境界内に入ることを要求
+  prediction_fit_ratio: 0.93 # 全予測点の車両中心がL1境界内に入ることを要求
   probe_success_cycles: 15    # L1制約でこの回数連続して正常に解けた場合だけL1固定を確定
   probe_retry_cooldown_sec: 2.0 # [s] L1 probe失敗後の再試行禁止時間
   probe_retry_min_wp_progress: 5 # probe失敗地点からこのWaypoint数以上進むまで再試行しない
@@ -168,7 +179,7 @@ mpc:
   ay_max: 18.0  # m/s^2, maximum lateral acceleration in curves
   # kappa_actual = kappa_cmd / (1 + understeer_coeff * v^2)
   # 0.002 gives about 16% curvature loss at 35 km/h.
-  understeer_coeff: 0.002  # [s^2/m^2]
+  understeer_coeff: 0.001  # [s^2/m^2]
   Q: [3000000.0, 55000000.0, 2000000.0]
   QN: [1000000.0, 1000000.0, 10000.0]
 

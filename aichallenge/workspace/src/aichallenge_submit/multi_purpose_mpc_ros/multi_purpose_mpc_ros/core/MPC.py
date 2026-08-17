@@ -296,6 +296,8 @@ class MPC:
         self.soft_target_lane_idx = None
         self.soft_target_start_e_y = 0.0
         self.soft_target_alpha = 0.0
+        self.soft_target_lateral_offset = 0.0
+        self.soft_lateral_targets = None
 
         # setupが済んでいるかどうか
         self.osqp_initialized = False
@@ -378,10 +380,15 @@ class MPC:
         self.time_budget_exceeded = False
         self.recovery_requested = False
         self.failure_reason = None
+        # Shadow/recovery callers distinguish an exact OSQP solution from
+        # SOLVED_INACCURATE without reaching into the solver result object.
+        self.last_solution_status = None
+        self.last_solution_accurate = False
         self.soft_target_lane_idx = None
         self.soft_target_start_e_y = 0.0
         self.soft_target_alpha = 0.0
         self.soft_target_lateral_offset = 0.0
+        self.soft_lateral_targets = None
         # Snapshot of the exact corridor used by the latest solve attempt.
         # These values remain available after an infeasible solve so the
         # controller can diagnose lane-bound and obstacle-induced failures.
@@ -431,7 +438,7 @@ class MPC:
 
     def set_soft_lateral_reference(
         self, lane_idx=None, start_e_y=0.0, alpha=0.0,
-        lateral_offset=0.0,
+        lateral_offset=0.0, lateral_targets=None,
     ) -> None:
         """Set an objective-only lane reference without narrowing bounds."""
         self.soft_target_lane_idx = (
@@ -440,6 +447,12 @@ class MPC:
         self.soft_target_start_e_y = float(start_e_y)
         self.soft_target_alpha = float(np.clip(alpha, 0.0, 1.0))
         self.soft_target_lateral_offset = float(lateral_offset)
+        targets = (
+            None if lateral_targets is None
+            else np.asarray(lateral_targets, dtype=float).reshape(-1).copy()
+        )
+        self.soft_lateral_targets = (
+            targets if targets is not None and targets.size else None)
 
     def _compute_lane_center(self, wp_id: int, target_lane: int) -> float:
         lanes = self.model.reference_path.get_lane_bounds(wp_id)
@@ -672,22 +685,33 @@ class MPC:
             for n in range(N):
                 lane_centers.append(self._compute_lane_center(self.model.wp_id + n, target_lane))
             xr[0:N*self.nx:self.nx] = lane_centers
-        elif self.soft_target_lane_idx is not None:
+        elif (
+            self.soft_target_lane_idx is not None
+            or self.soft_lateral_targets is not None
+        ):
             # Only xr changes here. lb/ub above remain the full-width corridor,
             # and P/Q stay fixed, so obstacles may still move the solution away
             # from L1 when required.
             for n in range(N):
-                lane_center = self._compute_lane_center(
-                    self.model.wp_id + n, self.soft_target_lane_idx)
-                lane_center += self.soft_target_lateral_offset
+                if self.soft_lateral_targets is not None:
+                    lane_center = self.soft_lateral_targets[
+                        min(n, len(self.soft_lateral_targets) - 1)]
+                else:
+                    lane_center = self._compute_lane_center(
+                        self.model.wp_id + n, self.soft_target_lane_idx)
+                    lane_center += self.soft_target_lateral_offset
                 xr[n * self.nx] = blend_lateral_reference(
                     self.soft_target_start_e_y,
                     lane_center,
                     self.soft_target_alpha,
                 )
-            terminal_center = self._compute_lane_center(
-                self.model.wp_id + N, self.soft_target_lane_idx)
-            terminal_center += self.soft_target_lateral_offset
+            if self.soft_lateral_targets is not None:
+                terminal_center = self.soft_lateral_targets[
+                    min(N, len(self.soft_lateral_targets) - 1)]
+            else:
+                terminal_center = self._compute_lane_center(
+                    self.model.wp_id + N, self.soft_target_lane_idx)
+                terminal_center += self.soft_target_lateral_offset
             xr[N * self.nx] = blend_lateral_reference(
                 self.soft_target_start_e_y,
                 terminal_center,
@@ -809,6 +833,8 @@ class MPC:
         self.time_budget_exceeded = False
         self.recovery_requested = False
         self.failure_reason = None
+        self.last_solution_status = None
+        self.last_solution_accurate = False
 
         #最近傍Waypointを取得
         self.model.get_current_waypoint()
@@ -872,6 +898,10 @@ class MPC:
                 raise ValueError(
                     f"OSQP failed with status '{dec.info.status}'")
 
+            self.last_solution_status = str(dec.info.status)
+            solution_is_accurate = bool(
+                dec.info.status_val == osqp.constant('OSQP_SOLVED'))
+
             control_signals = np.array(dec.x[-N*nu:])
 
             # ステア角の計算と保存
@@ -904,6 +934,7 @@ class MPC:
             # Commit the candidate only after solver and geometry validation.
             self.current_control = control_signals
             self.current_prediction = candidate_prediction
+            self.last_solution_accurate = solution_is_accurate
 
             u = np.array([v, delta])
             max_delta = np.max(np.abs(control_signals[1:len(control_signals)//3*2:2]))

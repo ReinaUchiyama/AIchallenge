@@ -46,12 +46,12 @@ SAFETY_MARGIN = 0.3
 # しばらくカーブが続く」場合は lo 側 (i<lo) のランプを伸ばす。
 CORE_REGIONS = [
     # 元のS字/シケイン (traj idx245-265, s_m≈92-112m)。実測最小幅(右3.02m/左3.33m)。
-    dict(lo=513, hi=629, ramp_points_lo=200, ramp_points_hi=200, target_cap=2.5),
+    dict(lo=513, hi=629, ramp_points_lo=200, ramp_points_hi=200, target_cap=2.1),
     # 2つ目の高曲率反転区間 (traj idx134-149, s_m≈200-219m)。
     # 実測最小幅が右2.50m/左2.41mとやや狭いため TARGET_CAP は抑えめ。
     # 区間直後 (走行方向で lo 側 = idx1140未満) もしばらくカーブが続くため、
     # そちら側のランプだけ手前側(hi側)の2倍にしている。
-    dict(lo=1140, hi=1287, ramp_points_lo=350, ramp_points_hi=100, target_cap=1.8),
+    dict(lo=1140, hi=1287, ramp_points_lo=350, ramp_points_hi=100, target_cap=1.6),
 ]
 
 
