@@ -1,4 +1,5 @@
 from numpy.core import function_base
+import math
 import decimal
 import decimal
 from numpy import typing
@@ -127,6 +128,68 @@ def zero_inverted_bounds(lower_bounds, upper_bounds):
     return lower, upper
 
 
+def build_arc_length_steering_reservation(
+    distances,
+    steering_refs,
+    speeds,
+    delay_sec,
+    steering_rate,
+    current_steering,
+    command_period,
+):
+    """Build a delayed, steering-rate-feasible reference along arc length."""
+    distance_array = np.asarray(distances, dtype=float)
+    reference_array = np.asarray(steering_refs, dtype=float)
+    speed_array = np.asarray(speeds, dtype=float)
+    if (
+        distance_array.size == 0
+        or distance_array.size != reference_array.size
+        or distance_array.size != speed_array.size
+        or steering_rate <= 0.0
+    ):
+        return reference_array.copy()
+
+    count = distance_array.size
+    delayed = reference_array.copy()
+    for index in range(count):
+        target_distance = (
+            distance_array[index]
+            + max(float(speed_array[index]), 0.0)
+            * max(float(delay_sec), 0.0)
+        )
+        target_index = int(np.searchsorted(
+            distance_array, target_distance, side="left"))
+        target_index = min(max(target_index, index), count - 1)
+        delayed[index] = reference_array[target_index]
+
+    # Propagate future steering requirements backward so the actuator begins
+    # moving before the curve, while respecting its physical slew rate.
+    reserved = delayed.copy()
+    for index in range(count - 2, -1, -1):
+        ds = max(float(distance_array[index + 1] - distance_array[index]), 0.0)
+        speed = max(float(speed_array[index]), 0.5)
+        max_change = float(steering_rate) * ds / speed
+        reserved[index] = float(np.clip(
+            reserved[index],
+            reserved[index + 1] - max_change,
+            reserved[index + 1] + max_change,
+        ))
+
+    previous = float(current_steering)
+    for index in range(count):
+        if index == 0:
+            max_change = float(steering_rate) * max(float(command_period), 0.0)
+        else:
+            ds = max(float(
+                distance_array[index] - distance_array[index - 1]), 0.0)
+            speed = max(float(speed_array[index - 1]), 0.5)
+            max_change = float(steering_rate) * ds / speed
+        reserved[index] = float(np.clip(
+            reserved[index], previous - max_change, previous + max_change))
+        previous = reserved[index]
+    return reserved
+
+
 def is_plausible_world_prediction(
     world_prediction,
     current_position,
@@ -195,7 +258,8 @@ class MPC:
     def __init__(self, model, N, Q, R, QN, StateConstraints, InputConstraints,
                  ay_max, max_steering_rate, wp_id_offset, use_obstacle_avoidance,
                  use_path_constraints_topic, use_max_kappa_pred=True,
-                 understeer_coeff=0.0):
+                 understeer_coeff=0.0, steering_command_delay=0.15,
+                 steering_reservation_enabled=False):
         """
         Constructor for the Model Predictive Controller.
         :param model: bicycle model object to be controlled
@@ -297,6 +361,9 @@ class MPC:
         # 追加: ステアリングレート制限関連のパラメータ
         self.max_steering_rate = max_steering_rate
         self.previous_steering = 0.0  # 前回のステア角
+        self.steering_command_delay = max(float(steering_command_delay), 0.0)
+        self.steering_reservation_enabled = bool(
+            steering_reservation_enabled)
 
         # 追加: ay_maxによる速度制限の方式切り替え
         self.use_max_kappa_pred = use_max_kappa_pred
@@ -424,6 +491,48 @@ class MPC:
         # Consider control delay
         self.model.wp_id += self.wp_id_offset
 
+        reserved_steering = None
+        if self.steering_reservation_enabled:
+            horizon_distance = np.zeros(N + 1, dtype=float)
+            steering_reference = np.zeros(N + 1, dtype=float)
+            reservation_speeds = np.zeros(N + 1, dtype=float)
+            delta_limit = math.atan(
+                abs(float(self.input_constraints['umax'][1]))
+                * self.model.length)
+            for index in range(N + 1):
+                waypoint = self.model.reference_path.get_waypoint(
+                    self.model.wp_id + index)
+                speed = float(np.clip(
+                    waypoint.v_ref,
+                    self.input_constraints['umin'][0],
+                    self.input_constraints['umax'][0],
+                ))
+                gain = understeer_curvature_gain(
+                    speed, self.understeer_coeff)
+                commanded_curvature = waypoint.kappa / max(gain, 1e-3)
+                steering_reference[index] = float(np.clip(
+                    math.atan(self.model.length * commanded_curvature),
+                    -delta_limit,
+                    delta_limit,
+                ))
+                reservation_speeds[index] = max(speed, 0.0)
+                if index:
+                    previous_waypoint = self.model.reference_path.get_waypoint(
+                        self.model.wp_id + index - 1)
+                    horizon_distance[index] = (
+                        horizon_distance[index - 1]
+                        + float(waypoint - previous_waypoint)
+                    )
+            reserved_steering = build_arc_length_steering_reservation(
+                horizon_distance,
+                steering_reference,
+                reservation_speeds,
+                self.steering_command_delay,
+                self.max_steering_rate,
+                self.previous_steering,
+                self.model.Ts,
+            )
+
         # Iterate over horizon
         t_pref = time.perf_counter()
 
@@ -455,6 +564,11 @@ class MPC:
             # Request enough commanded curvature for the speed-dependent
             # model to achieve the reference-path curvature.
             kappa_cmd_ref = kappa_ref / max(curvature_gain, 1e-3)
+            if reserved_steering is not None:
+                kappa_cmd_ref = (
+                    math.tan(float(reserved_steering[n]))
+                    / self.model.length
+                )
             ur[n*self.nu:(n+1)*self.nu] = [v_ref, kappa_cmd_ref]
             uq[n * self.nx:(n+1)*self.nx] = B_lin.dot(
                 [v_ref, kappa_cmd_ref]) - f

@@ -507,7 +507,11 @@ class MPCController(Node):
                 self.USE_OBSTACLE_AVOIDANCE,
                 self._cfg.reference_path.use_path_constraints_topic,
                 mpc_cfg.use_max_kappa_pred,
-                mpc_cfg.understeer_coeff)
+                mpc_cfg.understeer_coeff,
+                steering_command_delay=float(getattr(
+                    cfg_mpc, "steering_command_delay", 0.15)),
+                steering_reservation_enabled=bool(getattr(
+                    cfg_mpc, "steering_reservation_enabled", False)))
 
             mpc.solve_time_budget_ms = max(float(getattr(
                 cfg_mpc, "solve_time_budget_ms", 20.0)), 0.0)

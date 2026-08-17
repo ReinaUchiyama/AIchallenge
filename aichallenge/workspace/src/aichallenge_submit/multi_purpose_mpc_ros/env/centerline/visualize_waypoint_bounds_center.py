@@ -5,8 +5,8 @@ import matplotlib.pyplot as plt
 #========================
 # CSV読み込み
 #========================
-traj = pd.read_csv("traj_center313.csv")
-bound = pd.read_csv("waypoint_bounds_center.csv")
+traj = pd.read_csv("traj_center_mincurv_capped.csv")
+bound = pd.read_csv("waypoint_bounds_center_mincurv_capped.csv")
 
 #========================
 # データ取得

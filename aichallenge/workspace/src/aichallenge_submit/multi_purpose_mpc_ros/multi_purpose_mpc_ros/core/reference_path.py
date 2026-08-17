@@ -1307,8 +1307,10 @@ class ReferencePath:
         target_lane = getattr(self, 'target_lane_idx', None)
         min_width = lane_minimum_free_segment_width(
             target_lane, model_width, self.inner_lane_width)
-        # min_segment_length = model_width / 4.0
-        min_segment_length = 0.1
+        # A post-margin corridor must still accommodate the lane-specific
+        # minimum width.  The former 0.1 m threshold could accept a sliver
+        # that was physically impossible for the vehicle.
+        min_segment_length = min_width
 
         # container for constraints and border cells
         ub_hor = []
@@ -1358,15 +1360,15 @@ class ReferencePath:
             # Check feasibility of the path
             # segment_lengthから両側のsafety_marginを引いた値がmin_segment_lengthより小さい場合は、
             # border_cellsで囲まれる領域の隙間が狭すぎて障害物回避が困難なため、
-            # 回避を諦めてwaypointのstaticなupper boundとlower boundを代わりに使用する
+            # Do not replace an obstacle-narrowed corridor with static full
+            # width: that would erase the obstacle from the MPC constraints.
+            # Use the zero-width sentinel and let the existing infeasibility
+            # recovery stop/replan safely.
             if segment_length_sm < min_segment_length:
-                # print("Infeasible path detected!")
-                # print(f"Waypoint: {wp_id}, n: {n}, Upper bound: {ub}")
-                # print(f"min_width: {min_width}, safety_margin: {safety_margin}, segment_length: {segment_length}, segment_length_sm: {segment_length_sm}")
-                (ub, lb) = (wp.ub, wp.lb)
-                upper_margin, lower_margin = lane_constraint_margins(
-                    target_lane, safety_margin)
-                # print(f"Updated Upper bound: {wp.ub}, Updated Lower bound: {wp.lb}")
+                ub = 0.0
+                lb = 0.0
+                upper_margin = 0.0
+                lower_margin = 0.0
 
             # Subtract safety margin
             ub_sm = ub - upper_margin
@@ -1520,10 +1522,10 @@ class ReferencePath:
                 #if not self.is_overtaking:
                     #print(f"No feasible free segment found! wp_id: {wp_id}, n: {n}. Forcing minimum width.", flush=True)
 
-                # A forced 1.6 m corridor can be narrower than the vehicle.
-                # Fall back to the full static corridor in every mode.
-                ub_ls = wp.static_border_cells[0]
-                lb_ls = wp.static_border_cells[1]
+                # No vehicle-width passage exists. Preserve that fact instead
+                # of erasing obstacles via static full-width or ±0.8 m bounds.
+                ub_ls = (wp.x, wp.y)
+                lb_ls = (wp.x, wp.y)
 
                 add_constraint(wp, ub_ls, lb_ls)
 
