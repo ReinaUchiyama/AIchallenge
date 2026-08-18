@@ -870,7 +870,7 @@ def longitudinal_vehicle_clearance(
 
 def emergency_hard_stop_required(
     *, distance, hard_stop_distance: float, lateral_clearance,
-    longitudinal_clearance, hard_clearance: float
+    longitudinal_clearance, hard_clearance: float, same_lane: bool = False,
 ) -> bool:
     """Return whether proximity/envelope overlap requires zero speed."""
     finite_distance = (
@@ -887,7 +887,18 @@ def emergency_hard_stop_required(
         and float(lateral_clearance) <= float(hard_clearance)
         and float(longitudinal_clearance) <= float(hard_clearance)
     )
-    return close_by_distance or envelope_danger
+    close_relevant = bool(
+        close_by_distance
+        and (
+            bool(same_lane)
+            or (
+                lateral_clearance is not None
+                and math.isfinite(float(lateral_clearance))
+                and float(lateral_clearance) <= float(hard_clearance)
+            )
+        )
+    )
+    return close_relevant or envelope_danger
 
 
 def select_parallel_abort_lane(ego_lane_idx, other_lane_idx):

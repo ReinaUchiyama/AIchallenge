@@ -659,6 +659,32 @@ class MPCController(Node):
             )),
         )
         self._mpc_prediction_fallback_cycles = 0
+        self._center_switch_steering_fallback_enabled = bool(getattr(
+            cfg_mpc, "active_path_steering_fallback_enabled",
+            getattr(cfg_mpc, "center_switch_steering_fallback_enabled", True)))
+        self._center_switch_steering_fallback_success_required = max(int(
+            getattr(cfg_mpc,
+                    "active_path_steering_fallback_success_cycles",
+                    getattr(cfg_mpc,
+                            "center_switch_steering_fallback_success_cycles", 3))), 1)
+        self._center_switch_steering_fallback_lookahead_wps = max(int(getattr(
+            cfg_mpc, "active_path_steering_fallback_lookahead_wps",
+            getattr(cfg_mpc,
+                    "center_switch_steering_fallback_lookahead_wps", 3))), 0)
+        self._center_switch_steering_fallback_ey_gain = max(float(getattr(
+            cfg_mpc, "active_path_steering_fallback_ey_gain",
+            getattr(cfg_mpc,
+                    "center_switch_steering_fallback_ey_gain", 0.35))), 0.0)
+        self._center_switch_steering_fallback_heading_gain = max(float(getattr(
+            cfg_mpc, "active_path_steering_fallback_heading_gain",
+            getattr(cfg_mpc,
+                    "center_switch_steering_fallback_heading_gain", 0.8))), 0.0)
+        self._center_switch_steering_fallback_speed = max(float(getattr(
+            cfg_mpc, "active_path_steering_fallback_speed",
+            getattr(cfg_mpc,
+                    "center_switch_steering_fallback_speed", 0.0))), 0.0)
+        self._center_switch_steering_fallback_armed = False
+        self._center_switch_steering_fallback_success_cycles = 0
 
         switch_cfg = getattr(self._cfg, "trajectory_switch", None)
         self._trajectory_enter_center_wps = int(
@@ -1320,6 +1346,25 @@ class MPCController(Node):
         self._adaptive_reverse_forward_success_cycles_required = max(int(
             get_cfg("adaptive_reverse_forward_success_cycles", 3)), 1)
         self._stuck_cooldown = float(get_cfg("cooldown", 2.0))
+        # 連続失敗エスカレーション: 短時間で後退リカバリーが繰り返し失敗する場合、
+        # 後退時間・後退距離上限・再試行間隔を段階的に増やして三竦み状態からの
+        # 脱出を早める。reset_window_sec以上正常走行できたらレベルは0に戻る。
+        self._stuck_escalation_enabled = bool(get_cfg("escalation_enabled", True))
+        self._stuck_escalation_max_level = max(int(get_cfg("escalation_max_level", 5)), 0)
+        self._stuck_escalation_reset_window_sec = max(float(get_cfg(
+            "escalation_reset_window_sec", 6.0)), 0.0)
+        self._stuck_escalation_duration_step_sec = max(float(get_cfg(
+            "escalation_duration_step_sec", 1.5)), 0.0)
+        self._stuck_escalation_duration_max_sec = max(float(get_cfg(
+            "escalation_duration_max_sec", 10.0)), self._stuck_reverse_duration)
+        self._stuck_escalation_distance_step_m = max(float(get_cfg(
+            "escalation_distance_step_m", 1.5)), 0.0)
+        self._stuck_escalation_distance_max_m = max(float(get_cfg(
+            "escalation_distance_max_m", 12.0)), self._adaptive_reverse_max_distance)
+        self._stuck_escalation_cooldown_step_sec = max(float(get_cfg(
+            "escalation_cooldown_step_sec", 1.0)), 0.0)
+        self._stuck_escalation_cooldown_max_sec = max(float(get_cfg(
+            "escalation_cooldown_max_sec", 8.0)), self._stuck_cooldown)
         self._stuck_forward_reverse_speed = abs(float(get_cfg("reverse_speed", 1.0)))
         self._stuck_reverse_speed = -abs(float(get_cfg("reverse_speed", 1.0)))
         self._stuck_reverse_acceleration = -abs(float(get_cfg("reverse_acceleration", 1.5)))
@@ -1369,6 +1414,8 @@ class MPCController(Node):
         self._adaptive_reverse_active = False
         self._adaptive_reverse_static_clearance = None
         self._adaptive_reverse_forward_success_cycles = 0
+        self._stuck_escalation_level = 0
+        self._stuck_recovery_last_completed_at = None
         self._localization_consistent_since = None
         self._localization_consistent = False
         self._localization_position_error = math.inf
@@ -1433,6 +1480,15 @@ class MPCController(Node):
                 f"adaptive_max={self._adaptive_reverse_max_distance:.2f}m "
                 f"localization_error_max="
                 f"{self._adaptive_reverse_localization_max_error:.2f}m "
+                f"escalation={self._stuck_escalation_enabled} "
+                f"levels=0-{self._stuck_escalation_max_level} "
+                f"duration_step={self._stuck_escalation_duration_step_sec:.1f}s "
+                f"duration_max={self._stuck_escalation_duration_max_sec:.1f}s "
+                f"distance_step={self._stuck_escalation_distance_step_m:.2f}m "
+                f"distance_max={self._stuck_escalation_distance_max_m:.2f}m "
+                f"cooldown_step={self._stuck_escalation_cooldown_step_sec:.1f}s "
+                f"cooldown_max={self._stuck_escalation_cooldown_max_sec:.1f}s "
+                f"reset_window={self._stuck_escalation_reset_window_sec:.1f}s "
                 f"source={__file__}"
             )
 
@@ -1628,6 +1684,185 @@ class MPCController(Node):
         predicted.theta = math.atan2(
             math.sin(predicted.theta), math.cos(predicted.theta))
         return predicted
+
+    def _active_path_geometric_fallback_steering(self) -> float:
+        """Return rate/outer-boundary limited steering for the active path."""
+        car = self._car
+        wp_id = int(car.wp_id)
+        ref_path = self._reference_path
+        target_wp = ref_path.get_waypoint(
+            (wp_id + self._center_switch_steering_fallback_lookahead_wps)
+            % ref_path.n_waypoints)
+        e_y = float(car.spatial_state.e_y)
+        e_psi = float(car.spatial_state.e_psi)
+        delta = (
+            math.atan(float(self._cfg.bicycle_model.length)
+                      * float(target_wp.kappa))
+            - self._center_switch_steering_fallback_ey_gain * e_y
+            - self._center_switch_steering_fallback_heading_gain * e_psi
+        )
+
+        # Do not command farther toward a physical outer boundary. e_y is
+        # positive toward ub and negative toward lb in the Center Frenet frame.
+        current_wp = ref_path.get_waypoint(wp_id)
+        half_width = 0.5 * float(self._cfg.bicycle_model.width)
+        guard = float(getattr(
+            self._cfg.mpc, "prediction_outer_boundary_guard", 0.10))
+        upper_center_limit = float(current_wp.ub) - half_width - guard
+        lower_center_limit = float(current_wp.lb) + half_width + guard
+        if e_y >= upper_center_limit:
+            delta = min(delta, 0.0)
+        elif e_y <= lower_center_limit:
+            delta = max(delta, 0.0)
+
+        delta_limit = float(self._mpc_cfg.delta_max)
+        rate_step = (
+            float(self._mpc_cfg.steer_rate_max)
+            / max(float(self._mpc_cfg.control_rate), 1e-6))
+        previous = float(self._mpc.previous_steering)
+        delta = float(np.clip(
+            delta,
+            previous - rate_step,
+            previous + rate_step,
+        ))
+        return float(np.clip(delta, -delta_limit, delta_limit))
+
+    def _old_active_prediction_is_safe(self) -> bool:
+        """Validate a reused prediction against current walls and V2X traffic."""
+        prediction = self._mpc.current_prediction
+        if prediction is None:
+            return False
+        pred_x, pred_y = prediction
+        if len(pred_x) == 0 or len(pred_x) != len(pred_y):
+            return False
+        half_width = 0.5 * float(self._cfg.bicycle_model.width)
+        guard = float(getattr(
+            self._cfg.mpc, "prediction_outer_boundary_guard", 0.10))
+        for x, y in zip(pred_x, pred_y):
+            wp_id = self._car.get_closest_waypoint(float(x), float(y))
+            waypoint = self._reference_path.get_waypoint(wp_id)
+            normal = float(waypoint.psi) + math.pi / 2.0
+            e_y = (
+                (float(x) - float(waypoint.x)) * math.cos(normal)
+                + (float(y) - float(waypoint.y)) * math.sin(normal)
+            )
+            if not (
+                float(waypoint.lb) + half_width + guard
+                <= e_y
+                <= float(waypoint.ub) - half_width - guard
+            ):
+                return False
+        if hasattr(self, "_v2x_tracker"):
+            for vehicle_id in self._v2x_tracker.active_vehicle_ids():
+                if not self._prediction_is_clear_for_mpc(
+                    self._mpc, vehicle_id
+                ):
+                    return False
+        return True
+
+    def _unsafe_static_fallback_distance(self):
+        """Return forward arc distance to the nearest fallback horizon point."""
+        fallback_ids = set(int(wp_id) for wp_id in getattr(
+            self._reference_path, "unsafe_static_fallback_wp_ids", []))
+        if not fallback_ids:
+            return None
+        n_waypoints = int(self._reference_path.n_waypoints)
+        current_wp = int(self._car.wp_id) % n_waypoints
+        previous = self._reference_path.get_waypoint(current_wp)
+        distance = 0.0
+        for offset in range(self._mpc.N + 1):
+            wp_id = (current_wp + offset) % n_waypoints
+            waypoint = self._reference_path.get_waypoint(wp_id)
+            if offset:
+                distance += math.hypot(
+                    float(waypoint.x) - float(previous.x),
+                    float(waypoint.y) - float(previous.y),
+                )
+            if wp_id in fallback_ids:
+                return float(distance)
+            previous = waypoint
+        return None
+
+    def _unsafe_static_fallback_blocker(self, pose, fallback_distance):
+        """Find a forward V2X vehicle responsible for a relevant fallback."""
+        if pose is None or fallback_distance is None:
+            return None
+        ego_frenet = self._center_frenet(pose.x, pose.y)
+        if ego_frenet is None:
+            return None
+        ego_lane = self._center_lane_index_for_offset(
+            pose.x, pose.y, ego_frenet[1])
+        relevant_lanes = set()
+        if ego_lane is not None:
+            relevant_lanes.add(int(ego_lane))
+        for lane_idx in (
+            getattr(self, "_target_lane_idx", None),
+            getattr(self, "_overtake_lane_idx", None),
+            getattr(self, "_outer_switch_shadow_lane_idx", None),
+        ):
+            if lane_idx in (0, 1, 2):
+                relevant_lanes.add(int(lane_idx))
+
+        # Dynamic rasterization broadens a vehicle over several nearby path
+        # samples. Match the fallback section to current/predicted V2X motion,
+        # but do not let an unrelated vehicle elsewhere in the horizon cause a
+        # stop merely because some static fallback waypoint exists.
+        association_tolerance = max(
+            4.0, 3.0 * float(self._center_arc_mean_wp_spacing))
+        prediction_sec = max(
+            float(self._prepass_lane_fallback_prediction_sec), 0.0)
+        prediction_times = np.linspace(0.0, prediction_sec, 6)
+        best = None
+        for vehicle_id in self._v2x_tracker.active_vehicle_ids():
+            samples = self._v2x_tracker._samples.get(vehicle_id)
+            if not samples:
+                continue
+            _, vehicle_x, vehicle_y = samples[-1]
+            current_longitudinal = self._center_longitudinal_between(
+                pose.x, pose.y, vehicle_x, vehicle_y)
+            if current_longitudinal is None or current_longitudinal <= 0.0:
+                continue
+            velocity_x, velocity_y = self._v2x_tracker.velocity(vehicle_id)
+            associated = False
+            for prediction_time in prediction_times:
+                predicted_x = vehicle_x + velocity_x * prediction_time
+                predicted_y = vehicle_y + velocity_y * prediction_time
+                predicted_longitudinal = self._center_longitudinal_between(
+                    pose.x, pose.y, predicted_x, predicted_y)
+                if predicted_longitudinal is None or predicted_longitudinal <= 0.0:
+                    continue
+                predicted_frenet = self._center_frenet(
+                    predicted_x, predicted_y)
+                if predicted_frenet is None:
+                    continue
+                predicted_lane = self._center_lane_index_for_offset(
+                    predicted_x, predicted_y, predicted_frenet[1])
+                lateral_clearance = lateral_vehicle_clearance(
+                    abs(predicted_frenet[1] - ego_frenet[1]),
+                    self._cfg.bicycle_model.width,
+                    self._v2x_parallel_vehicle_half_width,
+                )
+                lane_relevant = (
+                    predicted_lane in relevant_lanes
+                    or lateral_clearance <= self._emergency_hard_clearance
+                )
+                if (
+                    lane_relevant
+                    and abs(predicted_longitudinal - fallback_distance)
+                        <= association_tolerance
+                ):
+                    associated = True
+                    break
+            if not associated:
+                continue
+            candidate = {
+                "vehicle_id": vehicle_id,
+                "distance": float(current_longitudinal),
+                "lane_idx": predicted_lane,
+            }
+            if best is None or candidate["distance"] < best["distance"]:
+                best = candidate
+        return best
 
     def _apply_stuck_reverse_command(self, u) -> None:
         if self._stuck_reverse_command_mode in ("teleop", "awsim_reverse_button"):
@@ -2130,6 +2365,58 @@ class MPCController(Node):
         return self._map.static_disk_is_free(
             pose.x, pose.y, self._adaptive_reverse_footprint_radius)
 
+    def _stuck_escalation_register_trigger(self, now_sec: float) -> int:
+        """Advance the escalation level when a new stuck-recovery episode
+        starts shortly after the previous one finished (i.e. the previous
+        attempt did not actually resolve the deadlock). Reset to 0 once the
+        vehicle has been out of recovery for `escalation_reset_window_sec`,
+        which is treated as evidence the situation was genuinely cleared."""
+        if not self._stuck_escalation_enabled:
+            self._stuck_escalation_level = 0
+            return 0
+        if (
+            self._stuck_recovery_last_completed_at is not None
+            and now_sec - self._stuck_recovery_last_completed_at
+                <= self._stuck_escalation_reset_window_sec
+        ):
+            self._stuck_escalation_level = min(
+                self._stuck_escalation_level + 1,
+                self._stuck_escalation_max_level,
+            )
+        else:
+            self._stuck_escalation_level = 0
+        return self._stuck_escalation_level
+
+    def _stuck_escalated_reverse_duration(self) -> float:
+        """Timed (non distance-bounded) reverse duration, stretched by the
+        current escalation level and capped at duration_max_sec."""
+        return min(
+            self._stuck_reverse_duration
+            + self._stuck_escalation_level * self._stuck_escalation_duration_step_sec,
+            self._stuck_escalation_duration_max_sec,
+        )
+
+    def _stuck_escalated_adaptive_max_distance(self) -> float:
+        """Ceiling used when sizing a wall/obstacle-bounded reverse. Raising
+        it on repeated failure only lets the planner use more of the space
+        that `_static_reverse_clearance`/`_reverse_rear_is_clear` already
+        verified as physically free -- it never overrides those safety
+        checks, it just allows exploring further into confirmed-clear space."""
+        return min(
+            self._adaptive_reverse_max_distance
+            + self._stuck_escalation_level * self._stuck_escalation_distance_step_m,
+            self._stuck_escalation_distance_max_m,
+        )
+
+    def _stuck_escalated_cooldown(self) -> float:
+        """Backoff between recovery attempts, stretched by escalation level
+        so identical retries are spaced further apart as failures repeat."""
+        return min(
+            self._stuck_cooldown
+            + self._stuck_escalation_level * self._stuck_escalation_cooldown_step_sec,
+            self._stuck_escalation_cooldown_max_sec,
+        )
+
     def _prepare_follow_deadlock_reverse(
         self, *, pose, now_sec: float, ego_speed: float, target_id
     ) -> str:
@@ -2161,8 +2448,9 @@ class MPCController(Node):
         if not eligible:
             return "legacy"
 
+        effective_max_distance = self._stuck_escalated_adaptive_max_distance()
         scan_distance = (
-            self._adaptive_reverse_max_distance
+            effective_max_distance
             + self._adaptive_reverse_wall_margin
         )
         static_clearance = self._static_reverse_clearance(pose, scan_distance)
@@ -2180,10 +2468,10 @@ class MPCController(Node):
             )
             return "blocked"
 
-        target_distance = min(available, self._adaptive_reverse_max_distance)
+        target_distance = min(available, effective_max_distance)
         mode = (
             "adaptive"
-            if available >= self._adaptive_reverse_max_distance
+            if available >= effective_max_distance
             else "wall_bounded"
         )
         if target_distance < self._adaptive_reverse_min_clear_distance:
@@ -2208,7 +2496,10 @@ class MPCController(Node):
             f"forward_mpc_{self._adaptive_reverse_forward_success_cycles_required}_cycles, "
             f"distance_limit={target_distance:.2f}m, static_clearance="
             f"{static_clearance:.2f}m, usable={available:.2f}m, "
-            f"localization_error={self._localization_position_error:.2f}m"
+            f"localization_error={self._localization_position_error:.2f}m, "
+            f"escalation_level={self._stuck_escalation_level}/"
+            f"{self._stuck_escalation_max_level}, "
+            f"escalated_max_distance={effective_max_distance:.2f}m"
         )
         return mode
 
@@ -3062,6 +3353,7 @@ class MPCController(Node):
         self._outer_switch_shadow_success_cycles = 0
         self._outer_switch_shadow_retry_countdown = 0
         self._outer_switch_shadow_speed_limit = None
+        self._outer_switch_shadow_required_single_lane = False
         self._mpcN_center.set_soft_lateral_reference()
         probe = self._mpcN_outer_switch_probe
         probe.osqp_initialized = False
@@ -3097,6 +3389,52 @@ class MPCController(Node):
         if target_speed is None or target_speed > self._slow_lead_overtake_speed:
             return None
         return max(target_speed + self._slow_lead_probe_speed_margin, 0.5)
+
+    def _slow_lead_target_is_separated(self, target_id, pose) -> bool:
+        """Return true once speed matching is no longer needed for a pass."""
+        if target_id is None or pose is None:
+            return False
+        samples = self._v2x_tracker._samples.get(target_id)
+        if not samples:
+            return False
+        _, target_x, target_y = samples[-1]
+        longitudinal = self._center_longitudinal_between(
+            pose.x, pose.y, target_x, target_y)
+        # Once the target is behind, retaining its low-speed limit can only
+        # slow the completed pass and may keep it latched for an entire sector.
+        if longitudinal is not None and longitudinal <= -0.5:
+            return True
+
+        ego_frenet = self._center_frenet(pose.x, pose.y)
+        target_frenet = self._center_frenet(target_x, target_y)
+        if ego_frenet is None or target_frenet is None:
+            return False
+        ego_lane = self._center_lane_index_for_offset(
+            pose.x, pose.y, ego_frenet[1])
+        target_lane = self._center_lane_index_for_offset(
+            target_x, target_y, target_frenet[1])
+        lateral_clearance = lateral_vehicle_clearance(
+            abs(target_frenet[1] - ego_frenet[1]),
+            self._cfg.bicycle_model.width,
+            self._v2x_parallel_vehicle_half_width,
+        )
+        # Do not release merely because a lane boundary was crossed: require
+        # positive envelope clearance as well so speed matching still protects
+        # the physical lateral transition.
+        return bool(
+            ego_lane is not None
+            and target_lane is not None
+            and ego_lane != target_lane
+            and lateral_clearance > self._emergency_hard_clearance
+        )
+
+    def _target_is_stopped_for_required_lane(self, target_id) -> bool:
+        """Restrict the single-passage persistence mode to stopped leads."""
+        target_speed = self._target_center_longitudinal_speed(target_id)
+        return bool(
+            target_speed is not None
+            and target_speed <= self._stopped_lead_speed_threshold
+        )
 
     def _reset_outer_lane_reevaluation(self) -> None:
         self._outer_lane_last_reevaluate_at = None
@@ -3284,6 +3622,8 @@ class MPCController(Node):
         self, from_lane_idx: int, lane_idx: int, *, now_sec: float,
         hold_current_lane: bool = False,
         race_to_center_handoff: bool = False,
+        required_single_lane: bool = False,
+        target_id=None,
     ) -> bool:
         if self._predictive_corridor_guard_active:
             self.get_logger().warn(
@@ -3345,13 +3685,18 @@ class MPCController(Node):
             )
         self._outer_switch_shadow_from_lane_idx = int(from_lane_idx)
         self._outer_switch_shadow_lane_idx = int(lane_idx)
-        self._outer_switch_shadow_target_id = self._overtake_target_vehicle_id
+        self._outer_switch_shadow_target_id = (
+            self._overtake_target_vehicle_id
+            if target_id is None else target_id
+        )
         self._outer_switch_shadow_speed_limit = (
             self._slow_lead_probe_speed_limit(
                 self._outer_switch_shadow_target_id))
         self._outer_switch_shadow_hold_current_lane = bool(hold_current_lane)
         self._outer_switch_shadow_race_to_center = bool(
             race_to_center_handoff)
+        self._outer_switch_shadow_required_single_lane = bool(
+            required_single_lane)
         self._outer_switch_shadow_started_at = float(now_sec)
         self._outer_switch_shadow_start_e_y = float(
             self._carN_center.spatial_state.e_y)
@@ -3527,6 +3872,21 @@ class MPCController(Node):
                 "probing the opposite lane")
             self._reset_outer_switch_shadow()
             return
+        if (
+            self._outer_switch_shadow_required_single_lane
+            and not self._target_is_stopped_for_required_lane(
+                self._outer_switch_shadow_target_id)
+        ):
+            # The shadow itself remains a safe ordinary transition, but it no
+            # longer receives the stopped-vehicle-only persistent retry
+            # semantics once the lead starts moving.
+            self._outer_switch_shadow_required_single_lane = False
+            self.get_logger().info(
+                "[RequiredSingleLaneRelease] lead vehicle started moving; "
+                "continuing as an ordinary outer shadow without persistent "
+                f"single-lane retry: vehicle_id="
+                f"{self._outer_switch_shadow_target_id}"
+            )
         if self._l1_rejoin_owns_lateral_selection():
             self.get_logger().warn(
                 "[OuterSwitchShadowL1OwnerCancel] cancelling outer shadow "
@@ -3586,6 +3946,10 @@ class MPCController(Node):
         if elapsed >= phase_timeout:
             target_id = self._outer_switch_shadow_target_id
             from_lane = self._outer_switch_shadow_from_lane_idx
+            required_single_lane = bool(
+                self._outer_switch_shadow_required_single_lane
+                and self._target_is_stopped_for_required_lane(target_id)
+            )
             guidance_had_started = bool(
                 self._outer_switch_shadow_first_success)
             timeout_start_e_y = float(
@@ -3640,6 +4004,29 @@ class MPCController(Node):
                     "full width: "
                     f"vehicle_id={target_id}, source=L{from_lane}, "
                     f"failed_destination=L{lane_idx}, elapsed={elapsed:.2f}s"
+                )
+                return
+            if required_single_lane:
+                # This is not an optional opposite-side optimization: the
+                # latched target leaves exactly one physically and
+                # traffic-clear outer passage. Keep that destination and
+                # rebuild alignment under full-width constraints instead of
+                # falling back to L1, which cannot pass the target.
+                self._prepass_fallback_follow_active = False
+                self._prepass_fallback_blocked = False
+                self._prepass_fallback_lane_idx = None
+                self._prepass_failed_lane_idx = int(lane_idx)
+                self._prepass_fallback_recovery_active = True
+                self._prepass_fallback_recovery_stable_since = None
+                self._prepass_fallback_recovery_started_at = float(now_sec)
+                self._prepass_fallback_commit_pending = False
+                self._prepass_fallback_commit_lane_idx = None
+                self._overtake_lane_idx = int(lane_idx)
+                self.get_logger().warn(
+                    "[RequiredSingleLaneShadowRetry] the only available "
+                    "passing lane was not confirmed; retaining the lane "
+                    "choice and rebuilding full-width soft alignment: "
+                    f"vehicle_id={target_id}, lane=L{lane_idx}"
                 )
                 return
             self._switch_prepass_to_follow(
@@ -4817,6 +5204,37 @@ class MPCController(Node):
         self._l1_rejoin_backoff_failed_wp = None
         self._l1_rejoin_backoff_full_width_success_since = None
 
+    def _clear_center_l1_state_for_race(self) -> None:
+        """Release every Center/L1 owner before Race becomes the live path."""
+        self._l1_rejoin_pending_owner = False
+        self._center_lane_rejoin_active = False
+        self._center_lane_rejoin_constraint_released = False
+        self._center_lane_rejoin_stable_since = None
+        self._l1_probe_active = False
+        self._l1_probe_context = None
+        self._l1_probe_success_cycles = 0
+        self._l1_probe_constraint_applied = False
+        self._l1_safety_recovery_active = False
+        self._l1_safety_recovery_stable_since = None
+        self._l1_safety_recovery_context = None
+        self._l1_safety_reprobe_pending = False
+        self._l1_soft_rejoin_started_at = None
+        self._l1_soft_rejoin_start_e_y = None
+        self._l1_soft_rejoin_effective_ramp_sec = None
+        self._l1_soft_rejoin_full_strength_logged = False
+        self._outer_shadow_timeout_l1_rejoin_active = False
+        self._outer_shadow_timeout_l1_start_e_y = None
+        self._reset_l1_rejoin_backoff()
+
+        # Do not let a dormant Center objective reappear on the next switch.
+        self._reference_pathN_center.target_lane_idx = None
+        self._reference_pathN_center.is_overtaking = False
+        self._mpcN_center.set_soft_lateral_reference()
+        if self._target_lane_idx == 1:
+            self._target_lane_idx = None
+        if self._prepass_fallback_lane_idx == 1:
+            self._prepass_fallback_lane_idx = None
+
     def _start_l1_rejoin_backoff(
         self, now_sec: float, failed_wp: int, reason: str
     ) -> None:
@@ -5467,11 +5885,11 @@ class MPCController(Node):
                                 / max(self._stuck_forward_reverse_speed, 0.1)
                             )
                             reverse_timeout = max(
-                                self._stuck_reverse_duration,
+                                self._stuck_escalated_reverse_duration(),
                                 nominal_travel_sec + 2.0,
                             )
                         else:
-                            reverse_timeout = self._stuck_reverse_duration
+                            reverse_timeout = self._stuck_escalated_reverse_duration()
                         self._stuck_recovery_until = now_sec + reverse_timeout
                         self.get_logger().info(
                             "[StuckRecovery] AWSIM gear is REVERSE; starting reverse drive "
@@ -5543,7 +5961,8 @@ class MPCController(Node):
                 self._stuck_recovery_started_at is not None
             )
             self._stuck_recovery_until = None
-            self._stuck_cooldown_until = now_sec + self._stuck_cooldown
+            self._stuck_recovery_last_completed_at = now_sec
+            self._stuck_cooldown_until = now_sec + self._stuck_escalated_cooldown()
             self._stuck_since = None
             self._stuck_reverse_start_target_longitudinal = None
             self._stuck_reverse_target_distance = None
@@ -5717,6 +6136,19 @@ class MPCController(Node):
                     else now_sec
                 )
             elif now_sec - self._stuck_since >= self._stuck_time_threshold:
+                escalation_level = self._stuck_escalation_register_trigger(now_sec)
+                if escalation_level > 0:
+                    self.get_logger().warn(
+                        "[StuckRecoveryEscalation] recovery re-triggered "
+                        f"within {self._stuck_escalation_reset_window_sec:.1f}s of "
+                        "the previous attempt finishing; stretching this "
+                        f"attempt: level={escalation_level}/"
+                        f"{self._stuck_escalation_max_level}, "
+                        f"reverse_duration={self._stuck_escalated_reverse_duration():.1f}s, "
+                        "adaptive_max_distance="
+                        f"{self._stuck_escalated_adaptive_max_distance():.2f}m, "
+                        f"cooldown={self._stuck_escalated_cooldown():.1f}s"
+                    )
                 if recover_from_mpc_stall:
                     self.get_logger().warn(
                         "[MPCStallRecovery] starting reverse after GNSS "
@@ -7402,14 +7834,21 @@ class MPCController(Node):
                     switched_mpc.current_control)
                 switched_mpc.infeasibility_counter = 0
             self._mpcN.previous_steering = inherited_steering
+            # Both destination controllers start without a live prediction.
+            self._center_switch_steering_fallback_armed = bool(
+                self._center_switch_steering_fallback_enabled)
+            self._center_switch_steering_fallback_success_cycles = 0
             if not opponent_ahead_detected:
                 # The confirmed probe has handed ownership to Race. Stop the
                 # shadow state before the live Race solve later this cycle.
                 self._reset_race_rejoin_handoff()
-                self._outer_shadow_timeout_l1_rejoin_active = False
-                self._outer_shadow_timeout_l1_start_e_y = None
+                self._clear_center_l1_state_for_race()
                 self._race_to_center_outer_handoff_pending = False
                 self._race_to_center_outer_handoff_started_at = None
+                self.get_logger().info(
+                    "[CenterL1StateClearOnRace] released L1 probe, rejoin, "
+                    "soft-reference, backoff, and safety-recovery state"
+                )
             self.get_logger().info(
                 "[TrajectorySwitchSteeringSync] inherited current steering "
                 f"into the destination MPC: steering="
@@ -7735,12 +8174,16 @@ class MPCController(Node):
         )
         slow_lead_speed = self._target_center_longitudinal_speed(
             opponent_vehicle_id)
+        slow_lead_laterally_separated = (
+            self._slow_lead_target_is_separated(opponent_vehicle_id, pose)
+        )
         slow_lead_overtake_active = bool(
             opponent_ahead_detected
             and opponent_vehicle_id is not None
             and slow_lead_speed is not None
             and slow_lead_speed <= self._slow_lead_overtake_speed
             and opponent_distance <= self._slow_lead_probe_max_distance
+            and not slow_lead_laterally_separated
         )
         if slow_lead_overtake_active:
             if self._slow_lead_overtake_target_id != opponent_vehicle_id:
@@ -8116,6 +8559,7 @@ class MPCController(Node):
             )
             latch_candidate_vehicle_id = opponent_vehicle_id
             latch_candidate_lane_idx = new_target_lane_idx
+            required_single_shadow_started = False
             if (
                 not existing_outer_latch
                 and new_target_lane_idx in (0, 2)
@@ -8146,6 +8590,50 @@ class MPCController(Node):
                 )
                 latch_candidate_lane_idx = (
                     scored_lane if scored_lane in (0, 2) else 1)
+                clear_initial_outer_lanes = tuple(
+                    lane_idx for lane_idx in (0, 2)
+                    if initial_passage.get(lane_idx, False)
+                    and lane_conflicts_are_clear(initial_conflicts[lane_idx])
+                )
+                if (
+                    len(clear_initial_outer_lanes) == 1
+                    and latch_candidate_lane_idx
+                        == clear_initial_outer_lanes[0]
+                    and lead_is_stationary
+                ):
+                    required_lane_idx = int(clear_initial_outer_lanes[0])
+                    shadow_started = (
+                        self._start_outer_switch_shadow(
+                            1,
+                            required_lane_idx,
+                            now_sec=now_sec,
+                            hold_current_lane=False,
+                            required_single_lane=True,
+                            target_id=opponent_vehicle_id,
+                        )
+                    )
+                    # Whether probing starts now or a safety owner delays it,
+                    # this unique lane is handled here and must never fall
+                    # through to ordinary immediate hard-lane selection.
+                    required_single_shadow_started = True
+                    self._overtake_target_vehicle_id = opponent_vehicle_id
+                    self._overtake_lane_idx = required_lane_idx
+                    new_target_lane_idx = None
+                    overtake_latch_started = True
+                    if not shadow_started:
+                        self._prepass_failed_lane_idx = required_lane_idx
+                        self._prepass_fallback_recovery_active = True
+                        self._prepass_fallback_recovery_stable_since = None
+                        self._prepass_fallback_recovery_started_at = now_sec
+                    else:
+                        self.get_logger().warn(
+                            "[RequiredSingleLaneLatch] exactly one outer "
+                            "passage is available; retaining it under "
+                            "full-width constraints until soft guidance and "
+                            "shadow confirmation complete: "
+                            f"vehicle_id={opponent_vehicle_id}, "
+                            f"lane=L{required_lane_idx}"
+                        )
                 self.get_logger().info(
                     "[OuterLaneGeometryScore] selecting initial passing side: "
                     f"vehicle_id={opponent_vehicle_id}, preferred="
@@ -8170,24 +8658,25 @@ class MPCController(Node):
                     f"{self._overtake_latch_max_distance:.2f}m",
                     throttle_duration_sec=1.0,
                 )
-            (
-                new_target_lane_idx,
-                self._overtake_target_vehicle_id,
-                self._overtake_lane_idx,
-                overtake_latch_started,
-            ) = select_latched_overtake_lane(
-                opponent_ahead_detected and not self._parallel_abort_active,
-                latch_candidate_vehicle_id,
+            if not required_single_shadow_started:
                 (
-                    1 if (
-                        self._prepass_fallback_lane_idx == 1
-                        or self._prepass_fallback_follow_active
-                    )
-                    else latch_candidate_lane_idx
-                ),
-                self._overtake_target_vehicle_id,
-                self._overtake_lane_idx,
-            )
+                    new_target_lane_idx,
+                    self._overtake_target_vehicle_id,
+                    self._overtake_lane_idx,
+                    overtake_latch_started,
+                ) = select_latched_overtake_lane(
+                    opponent_ahead_detected and not self._parallel_abort_active,
+                    latch_candidate_vehicle_id,
+                    (
+                        1 if (
+                            self._prepass_fallback_lane_idx == 1
+                            or self._prepass_fallback_follow_active
+                        )
+                        else latch_candidate_lane_idx
+                    ),
+                    self._overtake_target_vehicle_id,
+                    self._overtake_lane_idx,
+                )
 
         # An outer-lane latch is intentionally sticky, but it must not remain
         # blind to a newly clear opposite side. Re-evaluate both outer lanes
@@ -8749,6 +9238,19 @@ class MPCController(Node):
                     and lane_conflicts_are_clear(passage_conflicts[lane_idx])
                     for lane_idx in candidate_outer_lanes
                 )
+                clear_outer_lanes = tuple(
+                    lane_idx for lane_idx in candidate_outer_lanes
+                    if timeout_physical_passage.get(lane_idx, False)
+                    and lane_conflicts_are_clear(passage_conflicts[lane_idx])
+                )
+                required_single_lane = (
+                    clear_outer_lanes[0]
+                    if (
+                        len(clear_outer_lanes) == 1
+                        and self._target_is_stopped_for_required_lane(
+                            timeout_target_id)
+                    ) else None
+                )
                 timeout_reasons = classify_prepass_timeout_reasons(
                     mpc_stable=prepass_mpc_stable,
                     heading_stable=prepass_heading_stable,
@@ -8833,7 +9335,38 @@ class MPCController(Node):
                     self._prepass_fallback_blocked = False
                     self._prepass_fallback_follow_active = False
                     failed_lane_idx = self._prepass_failed_lane_idx
-                    if (
+                    if required_single_lane == retry_lane_idx:
+                        # Even when this is the same lane that failed, never
+                        # apply it directly after a timeout. It is the only
+                        # available passage, so retain it while a shadow MPC
+                        # proves soft guidance and the eventual hard boundary.
+                        self._prepass_fallback_lane_idx = None
+                        self._prepass_fallback_commit_pending = False
+                        self._prepass_fallback_commit_lane_idx = None
+                        self._prepass_fallback_commit_success_since = None
+                        shadow_source_lane = (
+                            failed_lane_idx
+                            if failed_lane_idx in (0, 2) else 1
+                        )
+                        shadow_started = self._start_outer_switch_shadow(
+                            shadow_source_lane,
+                            retry_lane_idx,
+                            now_sec=current_time_sec,
+                            hold_current_lane=False,
+                            required_single_lane=True,
+                        )
+                        self._overtake_lane_idx = retry_lane_idx
+                        if not shadow_started:
+                            self._prepass_failed_lane_idx = retry_lane_idx
+                            self._prepass_fallback_recovery_active = True
+                            self._prepass_fallback_recovery_stable_since = None
+                            self._prepass_fallback_recovery_started_at = (
+                                current_time_sec)
+                        action = (
+                            f"only passage L{retry_lane_idx}; retaining it "
+                            "and shadow-probing from full width"
+                        )
+                    elif (
                         failed_lane_idx in (0, 2)
                         and retry_lane_idx in (0, 2)
                         and retry_lane_idx != failed_lane_idx
@@ -8880,7 +9413,8 @@ class MPCController(Node):
                     f"conflicts={passage_conflicts}, "
                     f"reverse_rear_clear={reverse_rear_clear}"
                 )
-                self._prepass_failed_lane_idx = None
+                if not self._prepass_fallback_recovery_active:
+                    self._prepass_failed_lane_idx = None
 
             # Full-width recovery must be stable both numerically and
             # dynamically before committing to another narrow lane. Heading
@@ -8931,6 +9465,21 @@ class MPCController(Node):
                 selected_fallback_lane = recovery_candidate_lane
                 candidate_conflicts = passage_conflicts
                 physical_passage = recovery_physical_passage
+                stable_clear_outer_lanes = tuple(
+                    lane_idx for lane_idx in (0, 2)
+                    if physical_passage.get(lane_idx, False)
+                    and lane_idx in candidate_conflicts
+                    and lane_conflicts_are_clear(
+                        candidate_conflicts[lane_idx])
+                )
+                required_single_lane = (
+                    stable_clear_outer_lanes[0]
+                    if (
+                        len(stable_clear_outer_lanes) == 1
+                        and self._target_is_stopped_for_required_lane(
+                            self._overtake_target_vehicle_id)
+                    ) else None
+                )
 
                 self._prepass_fallback_recovery_active = False
                 self._prepass_fallback_recovery_stable_since = None
@@ -8946,7 +9495,31 @@ class MPCController(Node):
                         self._l1_probe_success_cycles = 0
                         self._l1_probe_constraint_applied = False
                     else:
-                        if (
+                        if required_single_lane == selected_fallback_lane:
+                            self._prepass_fallback_lane_idx = None
+                            self._prepass_fallback_commit_pending = False
+                            self._prepass_fallback_commit_lane_idx = None
+                            self._prepass_fallback_commit_success_since = None
+                            shadow_source_lane = (
+                                previous_lane
+                                if previous_lane in (0, 2) else 1
+                            )
+                            shadow_started = self._start_outer_switch_shadow(
+                                shadow_source_lane,
+                                selected_fallback_lane,
+                                now_sec=current_time_sec,
+                                hold_current_lane=False,
+                                required_single_lane=True,
+                            )
+                            self._overtake_lane_idx = selected_fallback_lane
+                            if not shadow_started:
+                                self._prepass_failed_lane_idx = (
+                                    selected_fallback_lane)
+                                self._prepass_fallback_recovery_active = True
+                                self._prepass_fallback_recovery_stable_since = None
+                                self._prepass_fallback_recovery_started_at = (
+                                    current_time_sec)
+                        elif (
                             previous_lane in (0, 2)
                             and selected_fallback_lane != previous_lane
                         ):
@@ -8997,7 +9570,8 @@ class MPCController(Node):
                         f"follow: physical_passage={physical_passage}, "
                         f"conflicts={candidate_conflicts}"
                     )
-                self._prepass_failed_lane_idx = None
+                if not self._prepass_fallback_recovery_active:
+                    self._prepass_failed_lane_idx = None
 
         # Check if vehicle is in or near a curve based on waypoint ranges (when following centerline)
         is_curve_locked = False
@@ -9688,6 +10262,88 @@ class MPCController(Node):
         with self._stats.time_block("control"):
             u, max_delta = self._mpc.get_control()
 
+        active_path_steering_fallback_active = False
+        if (
+            self._center_switch_steering_fallback_enabled
+            and (
+                not recovery_active
+                or self._mpc_safety_recovery_active
+            )
+        ):
+            active_solution_valid = bool(
+                not self._mpc.recovery_requested
+                and self._mpc.infeasibility_counter == 0
+                and self._mpc.current_prediction is not None
+                and not self._mpc.used_prediction_fallback
+                and not self._mpc.time_budget_exceeded
+            )
+            active_solution_accurate = bool(
+                active_solution_valid
+                and getattr(self._mpc, "last_solution_accurate", False))
+            max_old_prediction_cycles = max(int(getattr(
+                self._cfg.mpc, "max_prediction_fallback_cycles", 3)), 0)
+            safe_old_prediction = bool(
+                self._mpc.used_prediction_fallback
+                and self._mpc.current_prediction is not None
+                and self._mpc.infeasibility_counter
+                    <= max_old_prediction_cycles
+                and self._old_active_prediction_is_safe()
+            )
+            if safe_old_prediction:
+                # MPC.get_control() has already advanced to the matching
+                # stored control element. Preserve both its speed and steering
+                # while the old world prediction remains inside current walls
+                # and clear of every tracked vehicle.
+                self._center_switch_steering_fallback_armed = True
+                self._center_switch_steering_fallback_success_cycles = 0
+                self.get_logger().info(
+                    "[ActivePathPredictionFallbackRetained] reusing a "
+                    "boundary- and traffic-validated old prediction instead "
+                    "of inserting a zero-speed geometric fallback: "
+                    f"cycle={self._mpc.infeasibility_counter}/"
+                    f"{max_old_prediction_cycles}, speed={float(u[0]):.2f}m/s",
+                    throttle_duration_sec=0.5,
+                )
+            elif not active_solution_valid:
+                self._center_switch_steering_fallback_armed = True
+                self._center_switch_steering_fallback_success_cycles = 0
+                fallback_delta = self._active_path_geometric_fallback_steering()
+                u[0] = min(
+                    float(u[0]), self._center_switch_steering_fallback_speed)
+                u[1] = fallback_delta
+                self._mpc.previous_steering = fallback_delta
+                active_path_steering_fallback_active = True
+                path_label = (
+                    "Center" if self._reference_path is self._reference_pathN_center
+                    else "Race")
+                self.get_logger().warn(
+                    "[ActivePathSteeringFallback] live MPC prediction is not "
+                    f"usable; commanding {path_label} geometric steering with "
+                    "stop/low-speed request: "
+                    f"wp={self._car.wp_id}, "
+                    f"e_y={self._car.spatial_state.e_y:.2f}m, "
+                    f"e_psi={math.degrees(self._car.spatial_state.e_psi):.1f}deg, "
+                    f"steering={fallback_delta:+.3f}rad",
+                    throttle_duration_sec=0.5,
+                )
+            elif active_solution_accurate and self._center_switch_steering_fallback_armed:
+                self._center_switch_steering_fallback_success_cycles += 1
+                if (
+                    self._center_switch_steering_fallback_success_cycles
+                    >= self._center_switch_steering_fallback_success_required
+                ):
+                    self._center_switch_steering_fallback_armed = False
+                    self._center_switch_steering_fallback_success_cycles = 0
+                    self.get_logger().info(
+                        "[ActivePathSteeringFallbackRelease] live MPC "
+                        "produced consecutive accurate solutions; normal "
+                        "steering owns control"
+                    )
+            elif self._center_switch_steering_fallback_armed:
+                # A boundary-validated inaccurate solution remains safer than
+                # an open-loop geometric command, but does not disarm fallback.
+                self._center_switch_steering_fallback_success_cycles = 0
+
         self._run_outer_switch_shadow_probe(
             predicted_pose,
             recovery_active=recovery_active,
@@ -9978,8 +10634,24 @@ class MPCController(Node):
             self._slow_lead_overtake_target_id
         )
         if slow_lead_live_target_id is not None:
-            slow_lead_live_speed_limit = self._slow_lead_probe_speed_limit(
-                slow_lead_live_target_id)
+            if self._slow_lead_target_is_separated(
+                slow_lead_live_target_id, pose
+            ):
+                if (
+                    self._slow_lead_overtake_target_id
+                    == slow_lead_live_target_id
+                ):
+                    self._slow_lead_overtake_target_id = None
+                self.get_logger().info(
+                    "[SlowLeadOvertakeSpeedMatchRelease] target is behind or "
+                    "occupies a different lane with safe lateral envelope "
+                    "clearance; releasing the approach-speed limit: "
+                    f"vehicle_id={slow_lead_live_target_id}",
+                    throttle_duration_sec=1.0,
+                )
+            else:
+                slow_lead_live_speed_limit = self._slow_lead_probe_speed_limit(
+                    slow_lead_live_target_id)
         if slow_lead_live_speed_limit is not None:
             # Prevent the live Center solution from consuming the longitudinal
             # gap while the speed-matched outer probe obtains its 2/3 exact
@@ -10248,6 +10920,7 @@ class MPCController(Node):
                                             longitudinal_clearance),
                                         hard_clearance=(
                                             self._emergency_hard_clearance),
+                                        same_lane=same_lane,
                                     )
                                 )
 
@@ -10707,16 +11380,51 @@ class MPCController(Node):
             ref_vel_kmph = min(ref_vel_kmph, slow_lead_live_speed_limit)
         unsafe_static_fallback_active = bool(getattr(
             self._reference_path, "unsafe_static_fallback_wp_ids", []))
+        unsafe_static_fallback_brake_active = False
         if unsafe_static_fallback_active:
             # Comparison mode may erase a real dynamic obstacle from the
-            # bounds. Its solution may preserve steering, but it must never
-            # authorize forward motion or lateral-transition progress.
-            ref_vel_kmph = 0.0
+            # bounds. Only brake when a forward V2X vehicle in the current or
+            # requested corridor can be associated with the erased section.
+            fallback_distance = self._unsafe_static_fallback_distance()
+            fallback_blocker = self._unsafe_static_fallback_blocker(
+                pose, fallback_distance)
+            unsafe_static_fallback_brake_active = fallback_blocker is not None
+        if unsafe_static_fallback_brake_active:
+            blocker_distance = float(fallback_blocker["distance"])
+            hard_stop = bool(
+                blocker_distance
+                    <= self._corridor_guard_hard_stop_distance
+            )
+            if hard_stop:
+                fallback_speed_limit = 0.0
+            else:
+                braking_distance = max(
+                    blocker_distance
+                    - self._corridor_guard_stop_margin,
+                    0.0,
+                )
+                fallback_speed_limit = math.sqrt(
+                    2.0
+                    * self._corridor_guard_deceleration
+                    * braking_distance
+                )
+            ref_vel_kmph = min(ref_vel_kmph, fallback_speed_limit)
             self.get_logger().warn(
-                "[UnsafeStaticFallbackStop] static-only fallback solved the "
-                "corridor; forcing zero speed until a fresh dynamic-bound "
-                "solution is available",
+                "[UnsafeStaticFallbackDistanceBrake] static-only fallback "
+                "erased a dynamic obstacle section; applying a distance-based "
+                "speed limit: "
+                f"vehicle_id={fallback_blocker['vehicle_id']}, "
+                f"distance={blocker_distance:.2f}m, "
+                f"fallback_distance={fallback_distance:.2f}m, "
+                f"limit={fallback_speed_limit:.2f}m/s, hard_stop={hard_stop}",
                 throttle_duration_sec=0.5,
+            )
+        elif unsafe_static_fallback_active:
+            self.get_logger().info(
+                "[UnsafeStaticFallbackDistanceBrakeSkip] no forward vehicle "
+                "in the current/requested corridor matches the static-only "
+                "fallback section; leaving longitudinal control unchanged",
+                throttle_duration_sec=1.0,
             )
         if self._predictive_corridor_guard_active:
             ref_vel_kmph = min(
@@ -10768,8 +11476,10 @@ class MPCController(Node):
             u[0] = min(u[0], ref_vel_kmph)
         if self._predictive_corridor_guard_active:
             u[0] = min(u[0], ref_vel_kmph)
-        if unsafe_static_fallback_active:
-            u[0] = 0.0
+        if unsafe_static_fallback_brake_active:
+            # Apply the computed distance limit. The previous code forced zero
+            # on every fallback cycle even when the logged limit was non-zero.
+            u[0] = min(u[0], ref_vel_kmph)
         if intentional_follow_stop_active:
             # The MPC solve above still contains the previous cycle's speed
             # limit, so apply the newly detected stop immediately as well.
@@ -10797,6 +11507,13 @@ class MPCController(Node):
             else:
                 # Probe and rear-blocked states are observation-only.
                 u[0] = 0.0
+
+        if active_path_steering_fallback_active:
+            # Apply last among ordinary longitudinal overrides so start boost,
+            # follow restart, or escape logic cannot accelerate a geometric
+            # fallback that has no MPC prediction behind it.
+            u[0] = min(
+                float(u[0]), self._center_switch_steering_fallback_speed)
 
         # 停止命令がコマンドで入力させたら減速させる
         if not self._enable_control:

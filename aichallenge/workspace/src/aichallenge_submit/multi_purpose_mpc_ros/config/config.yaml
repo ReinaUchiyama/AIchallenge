@@ -179,7 +179,7 @@ bicycle_model:
   width: 1.6   # +safety margin
 
 mpc:
-  N: 25
+  N: 22
   # Q: [e_y(横ずれ), e_psi(ヨー角ずれ), t]
   # R: [v, delta]
   # QN: [e_y, e_psi, t]
@@ -213,6 +213,12 @@ mpc:
   osqp_initialized: false #setup済みならtrueに
   prediction_outer_boundary_guard: 0.10 # [m] 物理外周境界から予測車両中心を追加で離す
   prediction_lateral_tolerance: 0.02 # [m] OSQP解採用時に許容する境界違反
+  active_path_steering_fallback_enabled: true # Race/CenterどちらでもMPC予測無効中は現在軌道の幾何操舵を使う
+  active_path_steering_fallback_success_cycles: 3 # 現在MPC正確解の連続回数で解除
+  active_path_steering_fallback_lookahead_wps: 3 # 現在軌道の曲率を参照する先行WP
+  active_path_steering_fallback_ey_gain: 0.35 # [rad/m] 現在軌道の横ずれ補正
+  active_path_steering_fallback_heading_gain: 0.8 # [rad/rad] 現在軌道の方位差補正
+  active_path_steering_fallback_speed: 0.0 # [m/s] 失敗中は停止要求し、残存速度中の旋回のみ確保
 
 
   ## ---------- 究極 ------------- ##
@@ -222,7 +228,7 @@ mpc:
   ay_max: 18.0  # m/s^2, maximum lateral acceleration in curves
   # kappa_actual = kappa_cmd / (1 + understeer_coeff * v^2)
   # 0.002 gives about 16% curvature loss at 35 km/h.
-  understeer_coeff: 0.001  # [s^2/m^2]
+  understeer_coeff: 0.002  # [s^2/m^2]
   Q: [3000000.0, 55000000.0, 2000000.0]
   QN: [1000000.0, 1000000.0, 10000.0]
 
@@ -272,7 +278,7 @@ v2x_obstacle_avoidance:
   parallel_vehicle_half_width: 0.725 # [m] 並走横クリアランス用の相手車両半幅
   parallel_ego_half_length: 1.0     # [m] 自車の全長2.0mに対する半長
   parallel_vehicle_half_length: 1.0 # [m] 相手車の全長2.0mに対する半長
-  emergency_hard_stop_distance: 3.0 # [m] 前方車の中心距離がこれ以下なら速度指令を必ず0にする
+  emergency_hard_stop_distance: 3.0 # [m] 同一走行帯または横包絡余裕0.1m以下の前方車に限り、この中心距離以下で0m/s
   emergency_hard_clearance: 0.10 # [m] 縦横の車体包絡間隔がともにこれ以下なら速度指令を必ず0にする
   parallel_critical_clearance: 0.30  # [m] 車両包絡間の実空きがこれ以下なら強減速
   parallel_warning_clearance: 1.30   # [m] 車両包絡間の実空きがこれ以下なら並走減速
@@ -312,7 +318,7 @@ follow_restart:
   lead_moving_speed: 0.5   # [m/s] 停止していた前方車が動き出したと判定する速度
   ego_stopped_speed: 0.3   # [m/s] 自車を停止中とみなす速度
   min_gap: 6.0             # [m] 再発進ブーストを許可する最低車間
-  start_min_gap: 4.0       # [m] 初期配置で前車が動き出した場合だけ使う早期再発進車間
+  start_min_gap: 6.5       # [m] 初期配置で前車が動き出した場合だけ使う早期再発進車間
   speed_margin: 1.5        # [m/s] 前方車速度へ加える再発進時の速度差
   max_speed: 3.0           # [m/s] 再発進ブースト中の上限速度
   acceleration: 2.0        # [m/s^2] 再発進時の最低加速度
@@ -360,6 +366,20 @@ stuck_recovery:
   adaptive_reverse_localization_fresh_sec: 0.5 # [s] 両位置情報の最大受信経過時間
   adaptive_reverse_localization_confirm_sec: 0.25 # [s] 整合条件の連続確認時間
   adaptive_reverse_forward_success_cycles: 3 # 有効な前進MPCをこの周期数連続確認したら後退終了
+  # 連続失敗エスカレーション: reset_window_sec以内に後退リカバリーが再発した場合、
+  # 「同じ後退では脱出できていない」とみなしlevelを1段階上げ、後退時間・
+  # 後退距離上限・再試行間隔を段階的に増やす。正常走行がreset_window_sec続けば
+  # levelは0に戻る。距離上限は_static_reverse_clearance等の安全判定を上書きしない
+  # （実際に空いている範囲内でしか後退しない）。
+  escalation_enabled: true
+  escalation_max_level: 5           # このレベル数を超えて増加しない
+  escalation_reset_window_sec: 6.0  # [s] 前回リカバリー終了後、この時間以内の再発でlevelを+1
+  escalation_duration_step_sec: 1.5 # [s] レベル毎に後退時間(reverse_duration)へ加算する量
+  escalation_duration_max_sec: 10.0 # [s] 後退時間の上限
+  escalation_distance_step_m: 1.5   # [m] レベル毎にadaptive_reverse_max_distanceへ加算する量
+  escalation_distance_max_m: 12.0   # [m] 後退距離上限の上限
+  escalation_cooldown_step_sec: 1.0 # [s] レベル毎にcooldownへ加算する量
+  escalation_cooldown_max_sec: 8.0  # [s] 再試行間隔(cooldown)の上限
   cooldown: 2.0
   reverse_speed: 1.5
   reverse_acceleration: 2.5

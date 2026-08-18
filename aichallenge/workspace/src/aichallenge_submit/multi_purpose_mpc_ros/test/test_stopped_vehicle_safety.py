@@ -315,13 +315,30 @@ class StoppedVehicleSafetyTest(unittest.TestCase):
 
 
 class PrepassSafetyRecoveryTest(unittest.TestCase):
-    def test_emergency_hard_stop_uses_distance_or_envelope_clearance(self):
+    def test_emergency_hard_stop_requires_relevant_lane_at_close_distance(self):
         self.assertTrue(emergency_hard_stop_required(
             distance=3.0,
             hard_stop_distance=3.0,
             lateral_clearance=1.0,
             longitudinal_clearance=1.0,
             hard_clearance=0.1,
+            same_lane=True,
+        ))
+        self.assertFalse(emergency_hard_stop_required(
+            distance=3.0,
+            hard_stop_distance=3.0,
+            lateral_clearance=0.64,
+            longitudinal_clearance=-0.8,
+            hard_clearance=0.1,
+            same_lane=False,
+        ))
+        self.assertTrue(emergency_hard_stop_required(
+            distance=3.0,
+            hard_stop_distance=3.0,
+            lateral_clearance=0.08,
+            longitudinal_clearance=1.0,
+            hard_clearance=0.1,
+            same_lane=False,
         ))
         self.assertTrue(emergency_hard_stop_required(
             distance=4.0,
@@ -329,6 +346,7 @@ class PrepassSafetyRecoveryTest(unittest.TestCase):
             lateral_clearance=0.08,
             longitudinal_clearance=0.05,
             hard_clearance=0.1,
+            same_lane=False,
         ))
         self.assertFalse(emergency_hard_stop_required(
             distance=4.0,
@@ -336,6 +354,7 @@ class PrepassSafetyRecoveryTest(unittest.TestCase):
             lateral_clearance=0.08,
             longitudinal_clearance=0.2,
             hard_clearance=0.1,
+            same_lane=False,
         ))
 
     def test_recovery_success_is_not_counted_during_reverse(self):
