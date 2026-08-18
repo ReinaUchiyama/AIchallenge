@@ -215,7 +215,16 @@ mpc:
   prediction_lateral_tolerance: 0.02 # [m] OSQP解採用時に許容する境界違反
   active_path_steering_fallback_enabled: true # Race/CenterどちらでもMPC予測無効中は現在軌道の幾何操舵を使う
   active_path_steering_fallback_success_cycles: 3 # 現在MPC正確解の連続回数で解除
-  active_path_steering_fallback_lookahead_wps: 3 # 現在軌道の曲率を参照する先行WP
+  active_path_steering_fallback_lookahead_wps: 3 # 直線・緩やか区間(|kappa|<=mid)の先行WP
+  # 曲率連動Lookahead (Lap5 WP90事故対策): visualize_track_curvature.pyでの
+  # センター軌道曲率実測(全354wp)に基づくしきい値。中央値|kappa|=0.075rad/m
+  # と、事故区間WP85-95のmax|kappa|=0.220rad/m(コース最狭クラス)を踏まえ、
+  # 高曲率区間ほど先読みを伸ばして方位破綻までの反応猶予を確保する。
+  active_path_steering_fallback_curvature_adaptive: true
+  active_path_steering_fallback_curvature_thresh_mid: 0.08 # [rad/m] 旋回半径12.5m相当。超えると中曲率(5wp)
+  active_path_steering_fallback_curvature_thresh_high: 0.15 # [rad/m] 旋回半径6.7m相当。超えると高曲率(7wp)
+  active_path_steering_fallback_lookahead_mid_wps: 5 # 中曲率区間の先行WP
+  active_path_steering_fallback_lookahead_high_wps: 7 # 高曲率区間(WP85-95等)の先行WP。約7m=0.95秒分の先読み
   active_path_steering_fallback_ey_gain: 0.35 # [rad/m] 現在軌道の横ずれ補正
   active_path_steering_fallback_heading_gain: 0.8 # [rad/rad] 現在軌道の方位差補正
   active_path_steering_fallback_speed: 0.0 # [m/s] 失敗中は停止要求し、残存速度中の旋回のみ確保

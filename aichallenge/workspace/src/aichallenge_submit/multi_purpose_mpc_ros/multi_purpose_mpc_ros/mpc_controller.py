@@ -671,6 +671,23 @@ class MPCController(Node):
             cfg_mpc, "active_path_steering_fallback_lookahead_wps",
             getattr(cfg_mpc,
                     "center_switch_steering_fallback_lookahead_wps", 3))), 0)
+        # 曲率連動Lookahead: 高曲率区間ほど幾何学フォールバック操舵の先読みを
+        # 伸ばし、方位破綻（WP90 Lap5事故のような180度コーナーでの
+        # コースアウト）までの反応猶予を確保する。しきい値・先読み数は
+        # visualize_track_curvature.pyでのセンター軌道曲率分布実測に基づく
+        # (mid: |kappa|>0.08rad/m相当=旋回半径12.5m以下, high: >0.15rad/m相当
+        # =旋回半径6.7m以下)。
+        self._center_switch_steering_fallback_curvature_adaptive = bool(getattr(
+            cfg_mpc, "active_path_steering_fallback_curvature_adaptive", True))
+        self._center_switch_steering_fallback_curvature_thresh_mid = max(float(getattr(
+            cfg_mpc, "active_path_steering_fallback_curvature_thresh_mid", 0.08)), 0.0)
+        self._center_switch_steering_fallback_curvature_thresh_high = max(float(getattr(
+            cfg_mpc, "active_path_steering_fallback_curvature_thresh_high", 0.15)),
+            self._center_switch_steering_fallback_curvature_thresh_mid)
+        self._center_switch_steering_fallback_lookahead_mid_wps = max(int(getattr(
+            cfg_mpc, "active_path_steering_fallback_lookahead_mid_wps", 5)), 0)
+        self._center_switch_steering_fallback_lookahead_high_wps = max(int(getattr(
+            cfg_mpc, "active_path_steering_fallback_lookahead_high_wps", 7)), 0)
         self._center_switch_steering_fallback_ey_gain = max(float(getattr(
             cfg_mpc, "active_path_steering_fallback_ey_gain",
             getattr(cfg_mpc,
@@ -1690,9 +1707,18 @@ class MPCController(Node):
         car = self._car
         wp_id = int(car.wp_id)
         ref_path = self._reference_path
+        current_wp = ref_path.get_waypoint(wp_id)
+
+        lookahead_wps = self._center_switch_steering_fallback_lookahead_wps
+        if self._center_switch_steering_fallback_curvature_adaptive:
+            current_kappa = abs(float(current_wp.kappa))
+            if current_kappa > self._center_switch_steering_fallback_curvature_thresh_high:
+                lookahead_wps = self._center_switch_steering_fallback_lookahead_high_wps
+            elif current_kappa > self._center_switch_steering_fallback_curvature_thresh_mid:
+                lookahead_wps = self._center_switch_steering_fallback_lookahead_mid_wps
+
         target_wp = ref_path.get_waypoint(
-            (wp_id + self._center_switch_steering_fallback_lookahead_wps)
-            % ref_path.n_waypoints)
+            (wp_id + lookahead_wps) % ref_path.n_waypoints)
         e_y = float(car.spatial_state.e_y)
         e_psi = float(car.spatial_state.e_psi)
         delta = (
@@ -1704,7 +1730,6 @@ class MPCController(Node):
 
         # Do not command farther toward a physical outer boundary. e_y is
         # positive toward ub and negative toward lb in the Center Frenet frame.
-        current_wp = ref_path.get_waypoint(wp_id)
         half_width = 0.5 * float(self._cfg.bicycle_model.width)
         guard = float(getattr(
             self._cfg.mpc, "prediction_outer_boundary_guard", 0.10))
@@ -2552,6 +2577,38 @@ class MPCController(Node):
                 f"[FollowDeadlockEscape] released: reason={reason}"
             )
 
+    def _start_stopped_vehicle_immediate_escape(
+        self, target_id, now_sec: float
+    ) -> None:
+        """Arm FollowDeadlockEscape immediately for a confirmed-stationary lead.
+
+        Normally this state is only entered by _update_follow_deadlock_escape
+        after follow_control (ACC) engages and ego/lead/GNSS stay still for
+        deadlock_hold_sec. A lead already confirmed stationary by the
+        StoppedVehicle path (stopped_vehicle_overtake.speed_threshold) does
+        not need that confirmation window repeated, so this starts the same
+        escape probe (which re-scores L0/L1/L2 every cycle via
+        _select_follow_escape_lane, reusing the OuterLaneGeometryScore
+        primitives) right away instead of waiting behind L1.
+        """
+        if self._follow_escape_active and self._follow_escape_target_id == target_id:
+            return
+        self._reset_outer_switch_shadow()
+        self._reset_follow_escape()
+        self._follow_escape_active = True
+        self._follow_escape_target_id = target_id
+        self._overtake_target_vehicle_id = target_id
+        self._forced_overtake_vehicle_id = target_id
+        self._follow_latched_cache = None
+        self._follow_escape_last_reevaluate_at = None
+        self._follow_deadlock_since = None
+        self._follow_deadlock_start_xy = None
+        self.get_logger().warn(
+            "[StoppedVehicleImmediateEscape] lead already confirmed "
+            "stationary; starting the outer-lane escape probe immediately "
+            f"instead of waiting behind L1: vehicle_id={target_id}"
+        )
+
     def _reset_overtake_state_for_target_change(
         self, new_target_id, *, reason: str
     ) -> None:
@@ -2949,7 +3006,21 @@ class MPCController(Node):
             self._follow_deadlock_since = now_sec
             self._follow_deadlock_start_xy = position
             return
-        if now_sec - self._follow_deadlock_since < self._follow_deadlock_hold_sec:
+        # A lead already confirmed stationary by the StoppedVehicle path
+        # (stopped_vehicle_overtake.speed_threshold) does not need the
+        # ordinary continuous-stop confirmation window: whether it stopped is
+        # not in question, only which lane can pass it, so escape evaluation
+        # may start on the very next cycle instead of waiting the full
+        # deadlock_hold_sec.
+        hold_sec = (
+            0.0
+            if (
+                target_id == self._forced_overtake_vehicle_id
+                and lead_speed <= self._stopped_lead_speed_threshold
+            )
+            else self._follow_deadlock_hold_sec
+        )
+        if now_sec - self._follow_deadlock_since < hold_sec:
             return
 
         # FollowEscape becomes the sole lateral owner immediately. Do not
@@ -9010,6 +9081,17 @@ class MPCController(Node):
                     f"speed={opponent_v_lead:.2f}m/s; {action}.",
                     throttle_duration_sec=1.0,
                 )
+                # The ordinary OuterLaneGeometryScore latch above already had
+                # its chance this same cycle; if it could not commit L0/L2
+                # directly (e.g. a momentary traffic conflict) do not let the
+                # vehicle sit behind L1 waiting for follow_control to engage
+                # and then for the 2s FollowDeadlock confirmation window.
+                # Start the escape probe now so it keeps re-scoring L0/L2
+                # every cycle until one opens up or a reverse fallback is
+                # needed.
+                if self._overtake_lane_idx not in (0, 2):
+                    self._start_stopped_vehicle_immediate_escape(
+                        opponent_vehicle_id, current_time_sec)
             self._forced_overtake_vehicle_id = opponent_vehicle_id
         elif self._prepass_fallback_follow_active and not recovery_active:
             # A timed-out overtake is now ordinary longitudinal following,
