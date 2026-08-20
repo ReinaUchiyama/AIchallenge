@@ -459,57 +459,32 @@ def should_release_active_overtake_distance_gate(
     *, outer_lane_active: bool, target_longitudinal, distance,
     max_distance: float
 ) -> bool:
-    """Release a stale outer-lane constraint only after a confirmed pass.
+    """Release an ordinary outer-lane constraint once its lead exits the gate.
 
-    Distance alone is not evidence that an overtake completed: a faster lead
-    can simply pull away.  Require a negative Center-arc longitudinal delta so
-    an ahead target can never trigger L1/Race rejoin by crossing this gate.
-    """
-    return bool(
-        outer_lane_active
-        and target_longitudinal is not None
-        and math.isfinite(float(target_longitudinal))
-        and float(target_longitudinal) < 0.0
-        and distance is not None
-        and math.isfinite(float(distance))
-        and float(distance) >= float(max_distance)
-    )
-
-
-def should_abort_overtake_for_distant_lead(
-    *, outer_lane_active: bool, target_longitudinal, distance,
-    max_distance: float
-) -> bool:
-    """Abort the passing lane when the still-ahead target pulls away.
-
-    This is deliberately distinct from overtake completion.  The caller keeps
-    the target as a follow target, releases only L0/L2, and may return to Race
-    while the target remains outside the overtake-entry hysteresis gate.
+    The behind-target state machine remains responsible after the target is
+    passed.  This gate specifically prevents a still-ahead but already distant
+    target from retaining L0/L2 until that constraint eventually becomes
+    infeasible.
     """
     return bool(
         outer_lane_active
         and is_follow_target_ahead(target_longitudinal)
         and distance is not None
         and math.isfinite(float(distance))
-        and float(distance) >= max(float(max_distance), 0.0)
+        and float(distance) >= float(max_distance)
     )
 
 
 def should_release_prepass_distance_gate(
-    *, recovery_active: bool, target_longitudinal, distance,
-    max_distance: float
+    *, recovery_active: bool, distance, max_distance: float
 ) -> bool:
-    """Release active Prepass at the distance gate only after a pass.
+    """Release active Prepass immediately on a confirmed distance gate exit.
 
     A missing/non-finite V2X sample is not treated as a confirmed gate exit;
-    the existing target-loss hold remains responsible for that case.  A lead
-    pulling away remains a lead and must stay latched/followed.
+    the existing target-loss hold remains responsible for that case.
     """
     return bool(
         recovery_active
-        and target_longitudinal is not None
-        and math.isfinite(float(target_longitudinal))
-        and float(target_longitudinal) < 0.0
         and distance is not None
         and math.isfinite(float(distance))
         and float(distance) >= max(float(max_distance), 0.0)
@@ -676,15 +651,6 @@ def classify_lane_conflicts(
 
 def lane_conflicts_are_clear(conflicts) -> bool:
     return not any(conflicts.get(group) for group in ("front", "side", "rear"))
-
-
-def lane_conflict_score(conflicts) -> float:
-    """Return a conservative, ordered cost for lane traffic conflicts."""
-    return float(
-        3 * len(conflicts.get("front", ()))
-        + 5 * len(conflicts.get("side", ()))
-        + 2 * len(conflicts.get("rear", ()))
-    )
 
 
 def select_safe_outer_lane(
@@ -866,39 +832,6 @@ def longitudinal_vehicle_clearance(
         - max(float(ego_half_length), 0.0)
         - max(float(other_half_length), 0.0)
     )
-
-
-def emergency_hard_stop_required(
-    *, distance, hard_stop_distance: float, lateral_clearance,
-    longitudinal_clearance, hard_clearance: float, same_lane: bool = False,
-) -> bool:
-    """Return whether proximity/envelope overlap requires zero speed."""
-    finite_distance = (
-        distance is not None and math.isfinite(float(distance)))
-    close_by_distance = bool(
-        finite_distance
-        and float(distance) <= max(float(hard_stop_distance), 0.0)
-    )
-    envelope_danger = bool(
-        lateral_clearance is not None
-        and longitudinal_clearance is not None
-        and math.isfinite(float(lateral_clearance))
-        and math.isfinite(float(longitudinal_clearance))
-        and float(lateral_clearance) <= float(hard_clearance)
-        and float(longitudinal_clearance) <= float(hard_clearance)
-    )
-    close_relevant = bool(
-        close_by_distance
-        and (
-            bool(same_lane)
-            or (
-                lateral_clearance is not None
-                and math.isfinite(float(lateral_clearance))
-                and float(lateral_clearance) <= float(hard_clearance)
-            )
-        )
-    )
-    return close_relevant or envelope_danger
 
 
 def select_parallel_abort_lane(ego_lane_idx, other_lane_idx):

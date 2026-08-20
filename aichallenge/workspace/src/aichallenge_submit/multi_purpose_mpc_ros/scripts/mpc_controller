@@ -14,9 +14,6 @@ from multi_purpose_mpc_ros.common import parse_args_without_ros
 
 
 def main(argv = sys.argv) -> None:
-    node = None
-    executor_thread = None
-    unexpected_failure = False
 
     args = parse_args_without_ros(argv)
     rclpy.init(args=argv, signal_handler_options=SignalHandlerOptions.NO)
@@ -29,22 +26,14 @@ def main(argv = sys.argv) -> None:
         executor_thread.start()
         node.run()
     except KeyboardInterrupt:
-        if node is not None:
-            node.get_logger().info("Shutdown requested")
-    except Exception:
-        unexpected_failure = True
-        raise
+        node.get_logger().info("Shutdown requested")
     finally:
-        if node is not None:
-            # Do not call the failed control path again while unwinding an
-            # unexpected exception. stop() still publishes an immediate zero.
-            node.stop(run_control_loop=not unexpected_failure)
-        executor.shutdown()
-        if executor_thread is not None:
-            executor_thread.join(timeout=1.0)
-        if node is not None:
-            node.destroy_node()
+        node.stop()
         rclpy.shutdown()
+        for node in executor._nodes:
+            node.destroy_node()
+        executor.shutdown()
+        # executor._executor.shutdown()
 
 
 if __name__ == "__main__":
